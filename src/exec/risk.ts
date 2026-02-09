@@ -10,6 +10,8 @@ export interface RiskConfig {
   maxOpenOrders: number;
   cooldownMs: number;
   safeModeErrorThreshold: number;
+  perMarketCooldownMs?: number;     // #10 — per-market cooldown
+  minBalanceUsd?: number;           // #12 — balance floor
 }
 
 export interface RiskState {
@@ -21,6 +23,8 @@ export interface RiskState {
   consecutiveErrors: number;
   safeModeActive: boolean;
   lastDayUtc: number;
+  perMarketCooldownEnd: Map<string, number>;  // #10
+  lastKnownBalanceUsd: number;                 // #12
 }
 
 export class RiskManager {
@@ -36,6 +40,8 @@ export class RiskManager {
       consecutiveErrors: 0,
       safeModeActive: false,
       lastDayUtc: this.todayUtc(),
+      perMarketCooldownEnd: new Map(),
+      lastKnownBalanceUsd: Infinity,
     };
   }
 
@@ -55,16 +61,32 @@ export class RiskManager {
       return { allowed: false, reason: "Safe mode — too many consecutive errors" };
     }
 
-    // Cooldown
+    // Global cooldown
     const now = Date.now();
     if (now < this.state.cooldownEndMs) {
       return { allowed: false, reason: `In cooldown for ${this.state.cooldownEndMs - now}ms` };
+    }
+
+    // #10 — Per-market cooldown
+    const mktCooldownEnd = this.state.perMarketCooldownEnd.get(marketName) ?? 0;
+    if (now < mktCooldownEnd) {
+      return { allowed: false, reason: `Market ${marketName} on cooldown for ${mktCooldownEnd - now}ms` };
     }
 
     // Daily stop-loss
     this.maybeDayRoll();
     if (this.state.dailyLossUsd >= this.cfg.dailyStopLossUsd) {
       return { allowed: false, reason: "Daily stop-loss reached" };
+    }
+
+    // #12 — Balance floor check
+    if (this.cfg.minBalanceUsd !== undefined && this.state.lastKnownBalanceUsd < this.cfg.minBalanceUsd) {
+      return { allowed: false, reason: `Balance $${this.state.lastKnownBalanceUsd.toFixed(2)} below minimum $${this.cfg.minBalanceUsd}` };
+    }
+
+    // #12 — Check if we can afford this trade
+    if (this.state.lastKnownBalanceUsd < estimatedExposureUsd) {
+      return { allowed: false, reason: `Insufficient balance: need $${estimatedExposureUsd.toFixed(2)}, have $${this.state.lastKnownBalanceUsd.toFixed(2)}` };
     }
 
     // Global exposure
@@ -94,6 +116,11 @@ export class RiskManager {
     this.state.perMarketExposureUsd.set(marketName, Math.max(0, cur + marketDelta));
   }
 
+  /** #12 — Update known balance from API. */
+  updateBalance(balanceUsd: number): void {
+    this.state.lastKnownBalanceUsd = balanceUsd;
+  }
+
   recordOrderPlaced(): void {
     this.state.openOrderCount++;
   }
@@ -110,6 +137,13 @@ export class RiskManager {
   activateCooldown(): void {
     this.state.cooldownEndMs = Date.now() + this.cfg.cooldownMs;
     logger.info({ untilMs: this.state.cooldownEndMs }, "Cooldown activated");
+  }
+
+  /** #10 — Per-market cooldown after a trade or failure on a specific market. */
+  activateMarketCooldown(marketName: string): void {
+    const ms = this.cfg.perMarketCooldownMs ?? this.cfg.cooldownMs;
+    this.state.perMarketCooldownEnd.set(marketName, Date.now() + ms);
+    logger.info({ marketName, ms }, "Per-market cooldown activated");
   }
 
   recordError(): void {
@@ -179,6 +213,8 @@ export class RiskManager {
       consecutiveErrors: 0,
       safeModeActive: false,
       lastDayUtc: this.todayUtc(),
+      perMarketCooldownEnd: new Map(),
+      lastKnownBalanceUsd: Infinity,
     };
   }
 }

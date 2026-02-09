@@ -7,6 +7,7 @@ export const MarketBinarySchema = z.object({
   kind: z.literal("binary"),
   yesTokenId: z.string().min(1),
   noTokenId: z.string().min(1),
+  conditionId: z.string().optional(),
   resolutionGroup: z.string().optional(),
 });
 
@@ -19,6 +20,7 @@ export const MarketMultiSchema = z.object({
   name: z.string().min(1),
   kind: z.literal("multi"),
   outcomes: z.array(MarketOutcomeSchema).min(2),
+  conditionId: z.string().optional(),
   resolutionGroup: z.string().optional(),
 });
 
@@ -41,16 +43,54 @@ export const ConfigSchema = z.object({
   marketsFile: z.string().default("./markets.json"),
   pollingIntervalMs: z.number().min(100).default(400),
   minProfit: z.number().min(0).default(0.002),
-  feeBps: z.number().min(0).default(5),
+
+  /* ---- Fee model (#4) ---- */
+  feeBps: z.number().min(0).default(200),           // legacy / fallback
+  takerFeeBps: z.number().min(0).default(200),       // 2 % Polymarket taker fee
+  makerFeeBps: z.number().min(0).default(0),         // 0 % Polymarket maker fee
   slippageBps: z.number().min(0).default(10),
+
+  /* ---- Exposure ---- */
   maxExposureUsd: z.number().min(10).default(500),
   perMarketMaxUsd: z.number().min(10).default(150),
   dailyStopLossUsd: z.number().min(5).default(100),
   maxOpenOrders: z.number().min(1).default(10),
-  orderTimeoutMs: z.number().min(200).default(1500),
+
+  /* ---- Execution (#6, #15) ---- */
+  orderTimeoutMs: z.number().min(500).default(5000),  // raised from 1500
   cooldownMs: z.number().min(500).default(2500),
+  perMarketCooldownMs: z.number().min(0).default(5000), // #10 per-market cooldown
+  concurrentLegs: z.boolean().default(true),             // #6 concurrent legs
+  adaptiveTimeoutEnabled: z.boolean().default(true),     // #15 adaptive timeout
+  adaptiveTimeoutMinMs: z.number().min(500).default(2000),
+  adaptiveTimeoutMaxMs: z.number().min(1000).default(15000),
+
+  /* ---- Detection (#1, #8) ---- */
   minTopSizeUsd: z.number().min(1).default(20),
   priceImprovementTicks: z.number().min(-5).max(5).default(0),
+  maxSpreadBps: z.number().min(0).default(500),        // #8 reject wide spread legs
+  useBookDepthForDetection: z.boolean().default(true),  // #1 full VWAP detection
+
+  /* ---- Sizing (#5) ---- */
+  kellyFraction: z.number().min(0.01).max(1.0).default(0.25),
+  bankrollUsd: z.number().min(0).default(1000),        // Kelly bankroll reference
+
+  /* ---- Position management (#14) ---- */
+  positionMaxAgeMs: z.number().min(0).default(600_000), // 10 min
+  trailingStopBps: z.number().min(0).default(200),      // 2 %
+
+  /* ---- Duplicate suppression (#11) ---- */
+  oppCooldownMs: z.number().min(0).default(10_000),
+
+  /* ---- WebSocket (#7) ---- */
+  wsEnabled: z.boolean().default(false),
+  wsUrl: z.string().default("wss://ws-subscriptions-clob.polymarket.com/ws/market"),
+
+  /* ---- Market discovery (#9) ---- */
+  marketDiscoveryEnabled: z.boolean().default(false),
+  marketDiscoveryIntervalMs: z.number().min(10_000).default(300_000),
+  marketDiscoveryMinLiquidityUsd: z.number().min(0).default(500),
+
   enableLiveTrading: z.boolean().default(false),
   enableTelegram: z.boolean().default(true),
   safeModeErrorThreshold: z.number().min(1).default(5),

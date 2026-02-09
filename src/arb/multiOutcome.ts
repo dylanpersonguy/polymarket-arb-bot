@@ -1,5 +1,5 @@
 import { OrderBook } from "../clob/types.js";
-import { computeCostBreakdown, computeOptimalSize } from "./math.js";
+import { computeCostBreakdown, computeCostBreakdownVwap, computeOptimalSize, isSpreadAcceptable } from "./math.js";
 
 export interface MultiOutcomeLeg {
   label: string;
@@ -26,6 +26,7 @@ export interface MultiOutcomeOpportunity {
 
 export interface MultiDetectorConfig {
   feeBps: number;
+  takerFeeBps?: number;
   slippageBps: number;
   minProfit: number;
   maxExposureUsd: number;
@@ -33,6 +34,10 @@ export interface MultiDetectorConfig {
   minTopSizeUsd: number;
   stalenessMs: number;
   currentGlobalExposureUsd?: number;
+  maxSpreadBps?: number;              // #8
+  useBookDepthForDetection?: boolean;  // #1
+  bankrollUsd?: number;               // #5
+  kellyFraction?: number;             // #5
 }
 
 /**
@@ -54,8 +59,15 @@ export function detectMultiOutcomeArb(
   const askPrices: number[] = [];
   const askSizes: number[] = [];
 
+  // Use effective fee: takerFeeBps takes priority
+  const effectiveFee = cfg.takerFeeBps ?? cfg.feeBps;
+  const maxSpread = cfg.maxSpreadBps ?? 9999;
+
   for (const [tokenId, book] of books) {
     if (now - book.lastUpdatedMs > cfg.stalenessMs) return null;
+
+    // #8 — Spread filter per leg
+    if (!isSpreadAcceptable(book.bestAskPrice, book.bestBidPrice, maxSpread)) return null;
 
     const leg: MultiOutcomeLeg = {
       label: labels.get(tokenId) ?? tokenId,
@@ -77,34 +89,56 @@ export function detectMultiOutcomeArb(
   const rawSum = askPrices.reduce((a, b) => a + b, 0);
   if (rawSum >= 1.0) return null;
 
-  // Full cost breakdown
-  const bd = computeCostBreakdown(askPrices, cfg.feeBps, cfg.slippageBps);
+  // Full cost breakdown (top-of-book for quick reject)
+  const bd = computeCostBreakdown(askPrices, effectiveFee, cfg.slippageBps);
   if (bd.expectedProfit < cfg.minProfit) return null;
 
   // Sizing
   const remaining = Math.max(0, cfg.maxExposureUsd - (cfg.currentGlobalExposureUsd ?? 0));
-  const targetShares = computeOptimalSize(
+  let targetShares = computeOptimalSize(
     askPrices,
     askSizes,
-    cfg.feeBps,
+    effectiveFee,
     cfg.slippageBps,
     cfg.perMarketMaxUsd,
-    remaining
+    remaining,
+    cfg.bankrollUsd ?? 1000,
+    cfg.kellyFraction ?? 0.25
   );
 
   if (targetShares <= 0) return null;
+
+  // #1 — VWAP re-check using full book depth
+  let finalBd = bd;
+  if (cfg.useBookDepthForDetection) {
+    const allAsks = [...books.values()].map(b => b.asks);
+    const hasDepth = allAsks.every(a => a.length > 0);
+    if (hasDepth) {
+      const vwapBd = computeCostBreakdownVwap(allAsks, targetShares, effectiveFee, cfg.slippageBps);
+      if (vwapBd.expectedProfit < cfg.minProfit) return null;
+
+      // Shrink to fillable
+      const fillable = Math.min(...vwapBd.fillableSizes);
+      if (fillable < targetShares) {
+        targetShares = Math.floor(fillable);
+        if (targetShares <= 0) return null;
+      }
+
+      finalBd = vwapBd;
+    }
+  }
 
   return {
     type: "multi_outcome",
     tradeId: `multi_${now}_${Math.random().toString(36).slice(2, 8)}`,
     marketName,
     legs,
-    totalCost: bd.totalCost,
-    feeCost: bd.feeCost,
-    slippageCost: bd.slippageCost,
-    allInCost: bd.allInCost,
-    expectedProfit: bd.expectedProfit,
-    expectedProfitBps: bd.expectedProfitBps,
+    totalCost: finalBd.totalCost,
+    feeCost: finalBd.feeCost,
+    slippageCost: finalBd.slippageCost,
+    allInCost: finalBd.allInCost,
+    expectedProfit: finalBd.expectedProfit,
+    expectedProfitBps: finalBd.expectedProfitBps,
     targetSizeShares: targetShares,
     detectedAt: now,
   };

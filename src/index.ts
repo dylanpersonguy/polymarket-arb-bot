@@ -5,12 +5,15 @@ import { ClobClient } from "./clob/client.js";
 import { OrderBookManager } from "./clob/books.js";
 import { OrderManager } from "./clob/orders.js";
 import { PositionManager } from "./clob/positions.js";
+import { WsManager } from "./clob/wsManager.js";
 import { detectBinaryComplementArb } from "./arb/complement.js";
 import { detectMultiOutcomeArb } from "./arb/multiOutcome.js";
-import { bestOpportunity, filterByMinProfitBps } from "./arb/filters.js";
+import { bestOpportunity, filterByMinProfitBps, OppCooldownTracker, filterSuppressed } from "./arb/filters.js";
 import { Opportunity, oppSummary, isComplement } from "./arb/opportunity.js";
+import { MarketScanner } from "./arb/marketScanner.js";
 import { RiskManager } from "./exec/risk.js";
 import { Executor, ExecutionResult } from "./exec/executor.js";
+import { PositionMonitor, ExitResult } from "./exec/positionMonitor.js";
 import { PaperBroker } from "./sim/paperBroker.js";
 import { TelegramNotifier } from "./monitoring/telegram.js";
 import { HealthMonitor } from "./monitoring/health.js";
@@ -32,7 +35,7 @@ export async function main(): Promise<void> {
   /* ---- Load env & config ---- */
   const env: Env = loadEnv();
   const cfg: Config = loadConfig();
-  const markets: Market[] = loadMarkets();
+  let markets: Market[] = loadMarkets();
 
   const mode = env.MODE; // "dry" | "paper" | "live"
 
@@ -57,6 +60,8 @@ export async function main(): Promise<void> {
     cooldownMs: cfg.cooldownMs,
     maxOpenOrders: cfg.maxOpenOrders,
     safeModeErrorThreshold: cfg.safeModeErrorThreshold,
+    perMarketCooldownMs: cfg.perMarketCooldownMs,       // #10
+    minBalanceUsd: cfg.perMarketMaxUsd * 0.5,           // #12 — floor at 50% of per-market max
   });
 
   const executor = new Executor(clobClient, riskMgr, {
@@ -64,7 +69,17 @@ export async function main(): Promise<void> {
     priceImprovementTicks: cfg.priceImprovementTicks,
     enableLiveTrading: cfg.enableLiveTrading,
     mode,
+    concurrentLegs: cfg.concurrentLegs,                 // #6
+    adaptiveTimeoutEnabled: cfg.adaptiveTimeoutEnabled,  // #15
+    adaptiveTimeoutMinMs: cfg.adaptiveTimeoutMinMs,      // #15
+    adaptiveTimeoutMaxMs: cfg.adaptiveTimeoutMaxMs,      // #15
+    feeBps: cfg.takerFeeBps,                             // #13
+    slippageBps: cfg.slippageBps,                        // for revalidation
+    minProfit: cfg.minProfit,                            // for revalidation
   });
+
+  // #11 — Opportunity cooldown tracker
+  const oppTracker = new OppCooldownTracker(cfg.oppCooldownMs);
 
   const paperBroker = mode === "paper" ? new PaperBroker() : null;
 
@@ -76,6 +91,64 @@ export async function main(): Promise<void> {
 
   const health = new HealthMonitor();
   const metrics = new Metrics();
+
+  // #14 — Position monitor with trailing stop + age exit
+  const posMonitor = new PositionMonitor(clobClient, bookMgr, riskMgr, {
+    positionMaxAgeMs: cfg.positionMaxAgeMs,
+    trailingStopBps: cfg.trailingStopBps,
+    checkIntervalMs: Math.min(cfg.pollingIntervalMs, 2000),
+  });
+
+  posMonitor.start((exitResult: ExitResult) => {
+    logger.info({ ...exitResult }, "Position auto-exited");
+    metrics.inc("position_exits");
+    telegram.notifyTrade(exitResult.tradeId, "exit", exitResult.pnl, 1).catch(() => {});
+  });
+
+  // #7 — WebSocket book feed (optional)
+  let wsManager: WsManager | null = null;
+  if (cfg.wsEnabled) {
+    const allTokenIds = collectAllTokenIds(markets);
+    wsManager = new WsManager({
+      wsUrl: cfg.wsUrl,
+      reconnectIntervalMs: 5000,
+      tokenIds: allTokenIds,
+    });
+    wsManager.on("book", (tokenId: string, book: import("./clob/types.js").OrderBook) => {
+      bookMgr.set(tokenId, book);
+    });
+    wsManager.start();
+  }
+
+  // #9 — Market discovery (optional)
+  let scanner: MarketScanner | null = null;
+  if (cfg.marketDiscoveryEnabled) {
+    scanner = new MarketScanner({
+      intervalMs: cfg.marketDiscoveryIntervalMs,
+      minLiquidityUsd: cfg.marketDiscoveryMinLiquidityUsd,
+    });
+    scanner.start((newMarkets: Market[]) => {
+      markets = [...markets, ...newMarkets];
+      logger.info({ count: newMarkets.length, total: markets.length }, "Markets updated via discovery");
+
+      // If WS is active, subscribe to new token IDs
+      if (wsManager) {
+        const newIds = collectAllTokenIds(newMarkets);
+        wsManager.stop();
+        const allIds = collectAllTokenIds(markets);
+        wsManager = new WsManager({
+          wsUrl: cfg.wsUrl,
+          reconnectIntervalMs: 5000,
+          tokenIds: allIds,
+        });
+        wsManager.on("book", (tokenId: string, book: import("./clob/types.js").OrderBook) => {
+          bookMgr.set(tokenId, book);
+        });
+        wsManager.start();
+        logger.info({ newIds: newIds.length }, "WS resubscribed for new markets");
+      }
+    });
+  }
 
   // Persistence — only init in non-dry mode
   let tradeRepo: TradeRepository | null = null;
@@ -96,6 +169,10 @@ export async function main(): Promise<void> {
     logger.info("Shutting down…");
     running = false;
 
+    posMonitor.stop();
+    if (wsManager) wsManager.stop();
+    if (scanner) scanner.stop();
+
     // Cancel all open orders locally
     orderMgr.cancelAll();
 
@@ -109,25 +186,39 @@ export async function main(): Promise<void> {
 
   /* ---- Main loop ---- */
   let loopCount = 0;
-  const METRICS_LOG_INTERVAL = 60; // log metrics every N loops
+  const METRICS_LOG_INTERVAL = 60;
+  const BALANCE_CHECK_INTERVAL = 10;  // #12 — check balance every N loops
 
   while (running) {
     health.markLoopStart();
     loopCount++;
 
     try {
-      // 1. Refresh order books for all token IDs
-      for (const market of markets) {
-        const tokenIds: string[] = isBinary(market)
-          ? [market.yesTokenId, market.noTokenId]
-          : market.outcomes.map((o) => o.tokenId);
+      // #12 — Periodic balance refresh
+      if (loopCount % BALANCE_CHECK_INTERVAL === 1) {
+        try {
+          const bal = await clobClient.getBalance();
+          riskMgr.updateBalance(bal);
+          metrics.gauge("balance_usd", bal);
+        } catch (err) {
+          logger.debug({ err: String(err) }, "Balance check failed");
+        }
+      }
 
-        for (const tid of tokenIds) {
-          try {
-            const book = await clobClient.getOrderBook(tid);
-            if (book) bookMgr.set(tid, book);
-          } catch (err) {
-            logger.debug({ tokenId: tid, err: String(err) }, "Book fetch failed");
+      // 1. Refresh order books (skip if WS is feeding them)
+      if (!cfg.wsEnabled) {
+        for (const market of markets) {
+          const tokenIds: string[] = isBinary(market)
+            ? [market.yesTokenId, market.noTokenId]
+            : market.outcomes.map((o) => o.tokenId);
+
+          for (const tid of tokenIds) {
+            try {
+              const book = await clobClient.getOrderBook(tid);
+              if (book) bookMgr.set(tid, book);
+            } catch (err) {
+              logger.debug({ tokenId: tid, err: String(err) }, "Book fetch failed");
+            }
           }
         }
       }
@@ -138,13 +229,17 @@ export async function main(): Promise<void> {
       // 2. Detect opportunities across all markets
       const opps: Opportunity[] = [];
 
+      // Use effective fee throughout
+      const effectiveFee = cfg.takerFeeBps;
+
       for (const market of markets) {
         if (isBinary(market)) {
           const yesBook = bookMgr.get(market.yesTokenId);
           const noBook = bookMgr.get(market.noTokenId);
           if (yesBook && noBook) {
             const opp = detectBinaryComplementArb(market.name, yesBook, noBook, {
-              feeBps: cfg.feeBps,
+              feeBps: effectiveFee,
+              takerFeeBps: cfg.takerFeeBps,
               slippageBps: cfg.slippageBps,
               minProfit: cfg.minProfit,
               maxExposureUsd: cfg.maxExposureUsd,
@@ -152,6 +247,10 @@ export async function main(): Promise<void> {
               minTopSizeUsd: cfg.minTopSizeUsd,
               stalenessMs: cfg.pollingIntervalMs * 2 + 200,
               currentGlobalExposureUsd: positionMgr.totalExposureUsd(),
+              maxSpreadBps: cfg.maxSpreadBps,                      // #8
+              useBookDepthForDetection: cfg.useBookDepthForDetection, // #1
+              bankrollUsd: cfg.bankrollUsd,                         // #5
+              kellyFraction: cfg.kellyFraction,                     // #5
             });
             if (opp) opps.push(opp);
           }
@@ -168,7 +267,8 @@ export async function main(): Promise<void> {
 
           if (booksMap.size === market.outcomes.length) {
             const opp = detectMultiOutcomeArb(market.name, booksMap, labelsMap, {
-              feeBps: cfg.feeBps,
+              feeBps: effectiveFee,
+              takerFeeBps: cfg.takerFeeBps,
               slippageBps: cfg.slippageBps,
               minProfit: cfg.minProfit,
               maxExposureUsd: cfg.maxExposureUsd,
@@ -176,6 +276,10 @@ export async function main(): Promise<void> {
               minTopSizeUsd: cfg.minTopSizeUsd,
               stalenessMs: cfg.pollingIntervalMs * 2 + 200,
               currentGlobalExposureUsd: positionMgr.totalExposureUsd(),
+              maxSpreadBps: cfg.maxSpreadBps,                      // #8
+              useBookDepthForDetection: cfg.useBookDepthForDetection, // #1
+              bankrollUsd: cfg.bankrollUsd,                         // #5
+              kellyFraction: cfg.kellyFraction,                     // #5
             });
             if (opp) opps.push(opp);
           }
@@ -184,8 +288,9 @@ export async function main(): Promise<void> {
 
       metrics.inc("scan_cycles");
 
-      // 3. Filter & pick best
-      const qualified = filterByMinProfitBps(opps, cfg.minProfit * 10_000);
+      // 3. Filter: min profit, dedup/cooldown, then pick best
+      let qualified = filterByMinProfitBps(opps, cfg.minProfit * 10_000);
+      qualified = filterSuppressed(qualified, oppTracker);   // #11
       const best = bestOpportunity(qualified);
 
       if (best) {
@@ -198,11 +303,11 @@ export async function main(): Promise<void> {
         if (mode === "paper" && paperBroker) {
           // Paper mode: simulate fill
           const legs = isComplement(best)
-              ? [
-                  { tokenId: best.yesTokenId, size: best.targetSizeShares },
-                  { tokenId: best.noTokenId, size: best.targetSizeShares },
-                ]
-              : best.legs.map((l: { tokenId: string }) => ({ tokenId: l.tokenId, size: best.targetSizeShares }));
+            ? [
+                { tokenId: best.yesTokenId, size: best.targetSizeShares },
+                { tokenId: best.noTokenId, size: best.targetSizeShares },
+              ]
+            : best.legs.map((l: { tokenId: string }) => ({ tokenId: l.tokenId, size: best.targetSizeShares }));
 
           const { totalCost, trades } = paperBroker.simulateArbBuy(legs, freshBooks);
 
@@ -211,14 +316,43 @@ export async function main(): Promise<void> {
             tradeId: best.tradeId,
             legsAttempted: legs.length,
             legsFilled: trades.length,
+            legsPartial: 0,
             hedged: false,
             lossUsd: 0,
+            filledSizes: trades.map(() => best.targetSizeShares),
           };
 
           metrics.inc("paper_trades");
           logger.info({ totalCost, trades: trades.length }, "Paper trade executed");
         } else {
           execResult = await executor.execute(best, freshBooks);
+        }
+
+        // #11 — Record this opp in cooldown tracker
+        oppTracker.record(best);
+
+        // #10 — Per-market cooldown after execution
+        riskMgr.activateMarketCooldown(best.marketName);
+
+        // #14 — Track positions for auto-exit
+        if (execResult.success) {
+          const tokenIds = isComplement(best)
+            ? [best.yesTokenId, best.noTokenId]
+            : best.legs.map((l: { tokenId: string }) => l.tokenId);
+          const askPrices = isComplement(best)
+            ? [best.askYes, best.askNo]
+            : best.legs.map((l: { askPrice: number }) => l.askPrice);
+
+          for (let i = 0; i < tokenIds.length; i++) {
+            posMonitor.track({
+              tradeId: `${best.tradeId}_leg${i}`,
+              marketName: best.marketName,
+              tokenId: tokenIds[i],
+              entryPrice: askPrices[i],
+              size: execResult.filledSizes[i] ?? best.targetSizeShares,
+              enteredAt: Date.now(),
+            });
+          }
         }
 
         // 5. Record
@@ -229,11 +363,11 @@ export async function main(): Promise<void> {
               marketName: best.marketName,
               type: best.type,
               legs: isComplement(best)
-                  ? [
-                      { tokenId: best.yesTokenId, side: "buy", price: best.askYes },
-                      { tokenId: best.noTokenId, side: "buy", price: best.askNo },
-                    ]
-                  : best.legs,
+                ? [
+                    { tokenId: best.yesTokenId, side: "buy", price: best.askYes },
+                    { tokenId: best.noTokenId, side: "buy", price: best.askNo },
+                  ]
+                : best.legs,
               totalCost: best.allInCost,
               expectedProfit: best.expectedProfit,
               expectedProfitBps: best.expectedProfitBps,
@@ -279,11 +413,17 @@ export async function main(): Promise<void> {
 
     health.markLoopEnd();
 
+    // #11 — Prune stale cooldown entries periodically
+    if (loopCount % METRICS_LOG_INTERVAL === 0) {
+      oppTracker.prune();
+    }
+
     // Periodic metrics log
     if (loopCount % METRICS_LOG_INTERVAL === 0) {
       metrics.gauge("memory_mb", Math.round(process.memoryUsage().rss / 1024 / 1024));
       metrics.gauge("open_orders", orderMgr.openCount());
       metrics.gauge("exposure_usd", positionMgr.totalExposureUsd());
+      metrics.gauge("tracked_positions", posMonitor.getTracked().length);
       if (paperBroker) {
         metrics.gauge("paper_pnl", paperBroker.realizedPnl);
       }
@@ -293,4 +433,18 @@ export async function main(): Promise<void> {
     // Pause between scans
     await sleep(cfg.pollingIntervalMs);
   }
+}
+
+/* ---- helpers ---- */
+
+function collectAllTokenIds(mkts: Market[]): string[] {
+  const ids: string[] = [];
+  for (const m of mkts) {
+    if (isBinary(m)) {
+      ids.push(m.yesTokenId, m.noTokenId);
+    } else {
+      for (const o of m.outcomes) ids.push(o.tokenId);
+    }
+  }
+  return ids;
 }

@@ -1,5 +1,5 @@
 import { OrderBook } from "../clob/types.js";
-import { computeCostBreakdown, computeOptimalSize } from "./math.js";
+import { computeCostBreakdown, computeCostBreakdownVwap, computeOptimalSize, isSpreadAcceptable } from "./math.js";
 
 export interface ComplementOpportunity {
   type: "binary_complement";
@@ -25,6 +25,7 @@ export interface ComplementOpportunity {
 
 export interface ComplementDetectorConfig {
   feeBps: number;
+  takerFeeBps?: number;
   slippageBps: number;
   minProfit: number;
   maxExposureUsd: number;
@@ -32,6 +33,10 @@ export interface ComplementDetectorConfig {
   minTopSizeUsd: number;
   stalenessMs: number;
   currentGlobalExposureUsd?: number;
+  maxSpreadBps?: number;            // #8
+  useBookDepthForDetection?: boolean;  // #1
+  bankrollUsd?: number;             // #5
+  kellyFraction?: number;           // #5
 }
 
 /**
@@ -59,8 +64,16 @@ export function detectBinaryComplementArb(
   // Quick reject: raw cost already ≥ 1
   if (askYes + askNo >= 1.0) return null;
 
-  // Full cost breakdown
-  const bd = computeCostBreakdown([askYes, askNo], cfg.feeBps, cfg.slippageBps);
+  // #8 — Spread filter: reject if either side has a wide spread
+  const maxSpread = cfg.maxSpreadBps ?? 9999;
+  if (!isSpreadAcceptable(askYes, yesBook.bestBidPrice, maxSpread)) return null;
+  if (!isSpreadAcceptable(askNo, noBook.bestBidPrice, maxSpread)) return null;
+
+  // Use effective fee: takerFeeBps takes priority over legacy feeBps
+  const effectiveFee = cfg.takerFeeBps ?? cfg.feeBps;
+
+  // Full cost breakdown (top-of-book first for quick reject)
+  const bd = computeCostBreakdown([askYes, askNo], effectiveFee, cfg.slippageBps);
   if (bd.expectedProfit < cfg.minProfit) return null;
 
   // Liquidity: must have enough USD-size on each side
@@ -70,16 +83,41 @@ export function detectBinaryComplementArb(
 
   // Optimal sizing
   const remainingExposure = Math.max(0, cfg.maxExposureUsd - (cfg.currentGlobalExposureUsd ?? 0));
-  const targetShares = computeOptimalSize(
+  let targetShares = computeOptimalSize(
     [askYes, askNo],
     [yesBook.bestAskSize, noBook.bestAskSize],
-    cfg.feeBps,
+    effectiveFee,
     cfg.slippageBps,
     cfg.perMarketMaxUsd,
-    remainingExposure
+    remainingExposure,
+    cfg.bankrollUsd ?? 1000,
+    cfg.kellyFraction ?? 0.25
   );
 
   if (targetShares <= 0) return null;
+
+  // #1 — VWAP re-check: use full book depth to confirm profitability at target size
+  let finalBd = bd;
+  if (cfg.useBookDepthForDetection && yesBook.asks.length > 0 && noBook.asks.length > 0) {
+    const vwapBd = computeCostBreakdownVwap(
+      [yesBook.asks, noBook.asks],
+      targetShares,
+      effectiveFee,
+      cfg.slippageBps
+    );
+
+    // Re-check profitability with VWAP prices
+    if (vwapBd.expectedProfit < cfg.minProfit) return null;
+
+    // Shrink size if we can't fill fully
+    const fillable = Math.min(...vwapBd.fillableSizes);
+    if (fillable < targetShares) {
+      targetShares = Math.floor(fillable);
+      if (targetShares <= 0) return null;
+    }
+
+    finalBd = vwapBd;
+  }
 
   return {
     type: "binary_complement",
@@ -93,12 +131,12 @@ export function detectBinaryComplementArb(
     bidNo: noBook.bestBidPrice,
     sizeYes: yesBook.bestAskSize,
     sizeNo: noBook.bestAskSize,
-    totalCost: bd.totalCost,
-    feeCost: bd.feeCost,
-    slippageCost: bd.slippageCost,
-    allInCost: bd.allInCost,
-    expectedProfit: bd.expectedProfit,
-    expectedProfitBps: bd.expectedProfitBps,
+    totalCost: finalBd.totalCost,
+    feeCost: finalBd.feeCost,
+    slippageCost: finalBd.slippageCost,
+    allInCost: finalBd.allInCost,
+    expectedProfit: finalBd.expectedProfit,
+    expectedProfitBps: finalBd.expectedProfitBps,
     targetSizeShares: targetShares,
     detectedAt: now,
   };

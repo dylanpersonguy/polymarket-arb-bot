@@ -3,11 +3,14 @@ import {
   computeCostBreakdown,
   isProfitable,
   computeOptimalSize,
+  computeVwap,
+  computeCostBreakdownVwap,
+  isSpreadAcceptable,
   TICK_SIZE,
 } from "../src/arb/math.js";
 import { detectBinaryComplementArb, ComplementDetectorConfig } from "../src/arb/complement.js";
 import { detectMultiOutcomeArb, MultiDetectorConfig } from "../src/arb/multiOutcome.js";
-import { filterByMinProfitBps, sortByProfit, bestOpportunity } from "../src/arb/filters.js";
+import { filterByMinProfitBps, sortByProfit, bestOpportunity, OppCooldownTracker, filterSuppressed } from "../src/arb/filters.js";
 import { isComplement, isMultiOutcome, oppTokenIds } from "../src/arb/opportunity.js";
 import { OrderBook } from "../src/clob/types.js";
 
@@ -27,19 +30,17 @@ describe("computeCostBreakdown", () => {
   });
 
   it("computes correct profit for cheap ask pair", () => {
-    // 0.45 + 0.50 = 0.95 raw
     const result = computeCostBreakdown([0.45, 0.50], 0, 0);
     expect(result.totalCost).toBeCloseTo(0.95, 4);
     expect(result.expectedProfit).toBeCloseTo(0.05, 4);
-    expect(result.expectedProfitBps).toBeCloseTo(500, 0); // 0.05 * 10000 = 500 bps
+    expect(result.expectedProfitBps).toBeCloseTo(500, 0);
   });
 
   it("subtracts fee and slippage", () => {
-    const result = computeCostBreakdown([0.45, 0.50], 50, 10); // 0.5% fee, 0.1% slip
+    const result = computeCostBreakdown([0.45, 0.50], 50, 10);
     expect(result.feeCost).toBeGreaterThan(0);
     expect(result.slippageCost).toBeGreaterThan(0);
     expect(result.allInCost).toBeGreaterThan(result.totalCost);
-    // Profit reduced by costs
     expect(result.expectedProfit).toBeLessThan(0.05);
   });
 
@@ -59,7 +60,6 @@ describe("isProfitable", () => {
   });
 
   it("returns false when costs eat all profit", () => {
-    // 0.49 + 0.50 = 0.99 raw, plus 5% fee → definitely not profitable
     expect(isProfitable([0.49, 0.50], 500, 0, 0.01)).toBe(false);
   });
 
@@ -69,7 +69,77 @@ describe("isProfitable", () => {
 });
 
 /* ================================================================
- * computeOptimalSize
+ * computeVwap  (#1)
+ * ================================================================ */
+describe("computeVwap", () => {
+  it("returns correct VWAP for single level", () => {
+    const { vwap, fillableSize } = computeVwap([{ price: 0.50, size: 100 }], 50);
+    expect(vwap).toBeCloseTo(0.50, 4);
+    expect(fillableSize).toBe(50);
+  });
+
+  it("walks multiple levels", () => {
+    const levels = [
+      { price: 0.50, size: 100 },
+      { price: 0.52, size: 100 },
+    ];
+    const { vwap, fillableSize } = computeVwap(levels, 150);
+    // 100×0.50 + 50×0.52 = 76 / 150 = 0.5067
+    expect(vwap).toBeCloseTo(50 / 150 + 26 / 150, 3);
+    expect(fillableSize).toBe(150);
+  });
+
+  it("returns partial fill when book is thin", () => {
+    const levels = [{ price: 0.50, size: 30 }];
+    const { vwap, fillableSize } = computeVwap(levels, 100);
+    expect(fillableSize).toBe(30);
+    expect(vwap).toBeCloseTo(0.50, 4);
+  });
+
+  it("returns zero for empty book", () => {
+    const { vwap, fillableSize } = computeVwap([], 10);
+    expect(vwap).toBe(0);
+    expect(fillableSize).toBe(0);
+  });
+});
+
+/* ================================================================
+ * computeCostBreakdownVwap  (#1)
+ * ================================================================ */
+describe("computeCostBreakdownVwap", () => {
+  it("returns VWAP prices and fillable sizes", () => {
+    const asksA = [{ price: 0.47, size: 300 }, { price: 0.48, size: 200 }];
+    const asksB = [{ price: 0.51, size: 250 }, { price: 0.52, size: 200 }];
+    const result = computeCostBreakdownVwap([asksA, asksB], 100, 0, 0);
+
+    expect(result.vwapPrices.length).toBe(2);
+    expect(result.fillableSizes.length).toBe(2);
+    expect(result.vwapPrices[0]).toBeCloseTo(0.47, 2); // only hits first level
+    expect(result.vwapPrices[1]).toBeCloseTo(0.51, 2);
+    expect(result.expectedProfit).toBeCloseTo(0.02, 2);
+  });
+});
+
+/* ================================================================
+ * isSpreadAcceptable  (#8)
+ * ================================================================ */
+describe("isSpreadAcceptable", () => {
+  it("accepts tight spread", () => {
+    expect(isSpreadAcceptable(0.50, 0.49, 500)).toBe(true);
+  });
+
+  it("rejects wide spread", () => {
+    // spread = (0.50 - 0.30) / 0.50 = 40% = 4000 bps
+    expect(isSpreadAcceptable(0.50, 0.30, 500)).toBe(false);
+  });
+
+  it("rejects zero ask", () => {
+    expect(isSpreadAcceptable(0, 0, 500)).toBe(false);
+  });
+});
+
+/* ================================================================
+ * computeOptimalSize (#5 Kelly fix)
  * ================================================================ */
 describe("computeOptimalSize", () => {
   it("returns 0 when not profitable", () => {
@@ -83,14 +153,25 @@ describe("computeOptimalSize", () => {
   });
 
   it("caps at per-market max", () => {
-    // ask = 0.45, so maxByMarket = floor(200 / 0.50) = 400 → caps at 200/0.50
     const sz = computeOptimalSize([0.45, 0.50], [10000, 10000], 0, 0, 200, 50000);
-    expect(sz * 0.50).toBeLessThanOrEqual(200 + 0.01); // allow rounding tolerance
+    expect(sz * 0.50).toBeLessThanOrEqual(200 + 0.01);
   });
 
   it("returns positive size for profitable arb", () => {
     const sz = computeOptimalSize([0.45, 0.50], [500, 500], 5, 5, 500, 5000);
     expect(sz).toBeGreaterThan(0);
+  });
+
+  it("Kelly: larger bankroll → larger size", () => {
+    const szSmall = computeOptimalSize([0.45, 0.50], [5000, 5000], 0, 0, 50000, 50000, 500, 0.25);
+    const szLarge = computeOptimalSize([0.45, 0.50], [5000, 5000], 0, 0, 50000, 50000, 5000, 0.25);
+    expect(szLarge).toBeGreaterThan(szSmall);
+  });
+
+  it("Kelly: smaller fraction → smaller size", () => {
+    const szBig = computeOptimalSize([0.45, 0.50], [5000, 5000], 0, 0, 50000, 50000, 1000, 0.5);
+    const szSmall = computeOptimalSize([0.45, 0.50], [5000, 5000], 0, 0, 50000, 50000, 1000, 0.1);
+    expect(szBig).toBeGreaterThan(szSmall);
   });
 });
 
@@ -104,7 +185,7 @@ describe("TICK_SIZE", () => {
 });
 
 /* ================================================================
- * detectBinaryComplementArb
+ * detectBinaryComplementArb (updated with spread filter + VWAP)
  * ================================================================ */
 describe("detectBinaryComplementArb", () => {
   const baseCfg: ComplementDetectorConfig = {
@@ -120,7 +201,6 @@ describe("detectBinaryComplementArb", () => {
   it("detects arb when ask sum < 1.0", () => {
     const yes = freshBook(fixtureRaw.yesBook);
     const no = freshBook(fixtureRaw.noBook);
-    // 0.47 + 0.51 = 0.98 < 1.0 → profitable
     const opp = detectBinaryComplementArb("TestMarket", yes, no, baseCfg);
     expect(opp).not.toBeNull();
     expect(opp!.type).toBe("binary_complement");
@@ -146,6 +226,41 @@ describe("detectBinaryComplementArb", () => {
     const opp = detectBinaryComplementArb("TestMarket", null, null, baseCfg);
     expect(opp).toBeNull();
   });
+
+  it("#8 rejects wide spread legs", () => {
+    const yes = freshBook({ ...fixtureRaw.yesBook, bestAskPrice: 0.47, bestBidPrice: 0.10 });
+    const no = freshBook(fixtureRaw.noBook);
+    const opp = detectBinaryComplementArb("TestMarket", yes, no, { ...baseCfg, maxSpreadBps: 100 });
+    expect(opp).toBeNull();
+  });
+
+  it("#1 VWAP revalidation shrinks size to fillable", () => {
+    // With small book depth, VWAP should limit size
+    const yes = freshBook({ ...fixtureRaw.yesBook, asks: [{ price: 0.47, size: 10 }] });
+    const no = freshBook({ ...fixtureRaw.noBook, asks: [{ price: 0.51, size: 10 }] });
+    const opp = detectBinaryComplementArb("TestMarket", yes, no, {
+      ...baseCfg,
+      useBookDepthForDetection: true,
+      maxExposureUsd: 50000,
+      perMarketMaxUsd: 50000,
+      bankrollUsd: 50000,
+    });
+    if (opp) {
+      expect(opp.targetSizeShares).toBeLessThanOrEqual(10);
+    }
+  });
+
+  it("uses takerFeeBps when provided", () => {
+    const yes = freshBook(fixtureRaw.yesBook);
+    const no = freshBook(fixtureRaw.noBook);
+    // High fee should kill profitability
+    const opp = detectBinaryComplementArb("TestMarket", yes, no, {
+      ...baseCfg,
+      feeBps: 0,
+      takerFeeBps: 2000, // 20% fee
+    });
+    expect(opp).toBeNull();
+  });
 });
 
 /* ================================================================
@@ -163,7 +278,6 @@ describe("detectMultiOutcomeArb", () => {
   };
 
   it("detects arb when sum of asks < 1.0", () => {
-    // 0.30 + 0.29 + 0.31 = 0.90 < 1.0
     const books = new Map<string, OrderBook>();
     const labels = new Map<string, string>();
 
@@ -191,28 +305,38 @@ describe("detectMultiOutcomeArb", () => {
     const opp = detectMultiOutcomeArb("Expensive", books, labels, baseCfg);
     expect(opp).toBeNull();
   });
+
+  it("#8 rejects wide spread legs", () => {
+    const books = new Map<string, OrderBook>();
+    const labels = new Map<string, string>();
+
+    for (const b of fixtureRaw.multiBooks) {
+      books.set(b.tokenId, freshBook({
+        ...b,
+        bestBidPrice: 0.01, // very wide spread
+      } as Omit<OrderBook, "lastUpdatedMs">));
+      labels.set(b.tokenId, b.tokenId);
+    }
+
+    const opp = detectMultiOutcomeArb("Wide", books, labels, { ...baseCfg, maxSpreadBps: 100 });
+    expect(opp).toBeNull();
+  });
 });
 
 /* ================================================================
- * filters
+ * filters + OppCooldownTracker (#11)
  * ================================================================ */
 describe("filters", () => {
   it("filterByMinProfitBps removes below-threshold", () => {
     const yes = freshBook(fixtureRaw.yesBook);
     const no = freshBook(fixtureRaw.noBook);
     const opp = detectBinaryComplementArb("Market", yes, no, {
-      feeBps: 0,
-      slippageBps: 0,
-      minProfit: 0.001,
-      maxExposureUsd: 5000,
-      perMarketMaxUsd: 500,
-      minTopSizeUsd: 1,
-      stalenessMs: 5000,
+      feeBps: 0, slippageBps: 0, minProfit: 0.001,
+      maxExposureUsd: 5000, perMarketMaxUsd: 500, minTopSizeUsd: 1, stalenessMs: 5000,
     })!;
 
     expect(opp).not.toBeNull();
 
-    // 200 bps threshold → our 0.98 arb = 200bps
     const kept = filterByMinProfitBps([opp], 100);
     expect(kept.length).toBe(1);
 
@@ -228,20 +352,64 @@ describe("filters", () => {
       maxExposureUsd: 5000, perMarketMaxUsd: 500, minTopSizeUsd: 1, stalenessMs: 5000,
     })!;
 
-    // Make opp2 slightly worse by adding fee
     const opp2 = detectBinaryComplementArb("M2", a, b, {
       feeBps: 100, slippageBps: 0, minProfit: 0.001,
       maxExposureUsd: 5000, perMarketMaxUsd: 500, minTopSizeUsd: 1, stalenessMs: 5000,
     })!;
 
     if (!opp2) {
-      // opp2 might be null with fee, that's fine
       expect(bestOpportunity([opp1])).toBe(opp1);
     } else {
       const best = bestOpportunity([opp1, opp2]);
       expect(best).not.toBeNull();
       expect(best!.expectedProfitBps).toBeGreaterThanOrEqual(opp2.expectedProfitBps);
     }
+  });
+});
+
+/* ================================================================
+ * OppCooldownTracker  (#11)
+ * ================================================================ */
+describe("OppCooldownTracker", () => {
+  it("suppresses recently recorded opps", () => {
+    const tracker = new OppCooldownTracker(5000);
+    const yes = freshBook(fixtureRaw.yesBook);
+    const no = freshBook(fixtureRaw.noBook);
+    const opp = detectBinaryComplementArb("M1", yes, no, {
+      feeBps: 0, slippageBps: 0, minProfit: 0.001,
+      maxExposureUsd: 5000, perMarketMaxUsd: 500, minTopSizeUsd: 1, stalenessMs: 5000,
+    })!;
+
+    expect(tracker.isSuppressed(opp)).toBe(false);
+    tracker.record(opp);
+    expect(tracker.isSuppressed(opp)).toBe(true);
+  });
+
+  it("filterSuppressed removes suppressed opps", () => {
+    const tracker = new OppCooldownTracker(5000);
+    const yes = freshBook(fixtureRaw.yesBook);
+    const no = freshBook(fixtureRaw.noBook);
+    const opp = detectBinaryComplementArb("M1", yes, no, {
+      feeBps: 0, slippageBps: 0, minProfit: 0.001,
+      maxExposureUsd: 5000, perMarketMaxUsd: 500, minTopSizeUsd: 1, stalenessMs: 5000,
+    })!;
+
+    tracker.record(opp);
+    expect(filterSuppressed([opp], tracker)).toHaveLength(0);
+  });
+
+  it("reset clears all tracked keys", () => {
+    const tracker = new OppCooldownTracker(5000);
+    const yes = freshBook(fixtureRaw.yesBook);
+    const no = freshBook(fixtureRaw.noBook);
+    const opp = detectBinaryComplementArb("M1", yes, no, {
+      feeBps: 0, slippageBps: 0, minProfit: 0.001,
+      maxExposureUsd: 5000, perMarketMaxUsd: 500, minTopSizeUsd: 1, stalenessMs: 5000,
+    })!;
+
+    tracker.record(opp);
+    tracker.reset();
+    expect(tracker.isSuppressed(opp)).toBe(false);
   });
 });
 
