@@ -1,32 +1,61 @@
-export function calculateSlippage(
-  price: number,
-  size: number,
-  depth: Map<number, number>,
-  side: "buy" | "sell"
-): number {
-  let remainingSize = size;
-  let totalCost = 0;
+import { OrderBook } from "../clob/types.js";
+import Decimal from "decimal.js";
 
-  // Sort price levels (descending for sell, ascending for buy)
-  const pricePoints = Array.from(depth.keys()).sort((a, b) => (side === "buy" ? a - b : b - a));
+/**
+ * Walk the order book to estimate effective execution price for a
+ * given `sizeShares` of buying (take asks) or selling (take bids).
+ *
+ * Returns the volume-weighted average price (VWAP) and total cost.
+ */
+export interface SlippageEstimate {
+  vwap: number;
+  totalCost: number;
+  filledSize: number;
+  priceImpactBps: number;
+}
 
-  for (const level of pricePoints) {
-    const availableSize = depth.get(level) || 0;
-    if (availableSize === 0) continue;
+export function estimateBuySlippage(book: OrderBook, sizeShares: number): SlippageEstimate {
+  return walkSide(book.asks, sizeShares);
+}
 
-    const sizeToFill = Math.min(remainingSize, availableSize);
-    totalCost += sizeToFill * level;
-    remainingSize -= sizeToFill;
+export function estimateSellSlippage(book: OrderBook, sizeShares: number): SlippageEstimate {
+  return walkSide(book.bids, sizeShares);
+}
 
-    if (remainingSize === 0) break;
+function walkSide(
+  levels: { price: number; size: number }[],
+  sizeShares: number
+): SlippageEstimate {
+  if (levels.length === 0 || sizeShares <= 0) {
+    return { vwap: 0, totalCost: 0, filledSize: 0, priceImpactBps: 0 };
   }
 
-  if (remainingSize > 0) {
-    // Unable to fill entire size, estimate slippage
-    return 0.01; // 1% slippage as fallback
+  let remaining = new Decimal(sizeShares);
+  let cost = new Decimal(0);
+  let filled = new Decimal(0);
+  const bestPrice = new Decimal(levels[0].price);
+
+  for (const level of levels) {
+    if (remaining.lte(0)) break;
+    const take = Decimal.min(remaining, new Decimal(level.size));
+    cost = cost.plus(take.mul(new Decimal(level.price)));
+    filled = filled.plus(take);
+    remaining = remaining.minus(take);
   }
 
-  const averagePrice = totalCost / size;
-  const expectedPrice = side === "buy" ? price : price;
-  return Math.abs(averagePrice - expectedPrice) / price;
+  if (filled.isZero()) {
+    return { vwap: 0, totalCost: 0, filledSize: 0, priceImpactBps: 0 };
+  }
+
+  const vwap = cost.div(filled);
+  const impactBps = bestPrice.isZero()
+    ? 0
+    : vwap.minus(bestPrice).div(bestPrice).mul(10_000).toNumber();
+
+  return {
+    vwap: vwap.toNumber(),
+    totalCost: cost.toNumber(),
+    filledSize: filled.toNumber(),
+    priceImpactBps: Math.abs(impactBps),
+  };
 }

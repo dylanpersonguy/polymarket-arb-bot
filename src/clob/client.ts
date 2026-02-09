@@ -1,104 +1,85 @@
 import pino from "pino";
-import { OrderBook, Order, Position } from "./types.js";
+import { OrderBook, Order } from "./types.js";
 import { retry, CircuitBreaker } from "../utils/retry.js";
 import { AdaptiveRateLimiter } from "./rateLimit.js";
 import { Env } from "../config/schema.js";
 
+const logger = pino({ name: "ClobClient" });
+
 /**
- * CLOB Client Wrapper
- * 
- * This wraps the official @polymarket/clob-client with:
- * - Retry logic with exponential backoff
- * - Rate limiting and 429 handling
- * - Circuit breaker for cascading failures
- * - Structured logging
- * 
- * NOTE: In production, you would integrate the actual @polymarket/clob-client here.
- * For now, this is a minimal interface that maintains the contract.
+ * Wrapper around @polymarket/clob-client.
+ *
+ * In production you would instantiate the real ClobOrderUtils / ClobClient
+ * from the SDK.  This wrapper adds:
+ *  – rate limiting (adaptive token bucket)
+ *  – retry with exponential backoff + 429 handling
+ *  – circuit breaker to avoid hammering a failing endpoint
+ *
+ * The methods below are thin pass-throughs; swap the body for real SDK calls.
  */
 export class ClobClient {
-  private logger: pino.Logger;
-  private rateLimiter: AdaptiveRateLimiter;
-  private circuitBreaker: CircuitBreaker;
-  private books = new Map<string, OrderBook>();
-  private orders = new Map<string, Order>();
-  private positions = new Map<string, Position>();
+  private limiter: AdaptiveRateLimiter;
+  private breaker: CircuitBreaker;
 
   constructor(private env: Env) {
-    this.logger = pino({ name: "ClobClient" });
-    // Start with 10 requests per second; will adapt based on 429s
-    this.rateLimiter = new AdaptiveRateLimiter(10, 20);
-    this.circuitBreaker = new CircuitBreaker(5, 2, 30000);
+    this.limiter = new AdaptiveRateLimiter(10, 20);
+    this.breaker = new CircuitBreaker(5, 2, 30_000);
   }
 
   async initialize(): Promise<void> {
-    this.logger.info("Initializing CLOB client");
-
-    if (!this.env.POLYMARKET_PRIVATE_KEY) {
-      throw new Error("POLYMARKET_PRIVATE_KEY not set in environment");
+    if (!this.env.POLYMARKET_PRIVATE_KEY || this.env.POLYMARKET_PRIVATE_KEY === "0x") {
+      throw new Error("POLYMARKET_PRIVATE_KEY is not set or empty");
     }
-
-    // In a real implementation, you would initialize the @polymarket/clob-client here
-    // For now, we validate that the key exists
-    this.logger.info("CLOB client initialized");
+    logger.info("CLOB client initialised (mock mode — swap for real SDK)");
   }
 
+  /* ---- Order book ---- */
+
   async getOrderBook(tokenId: string): Promise<OrderBook> {
-    await this.rateLimiter.acquire(1);
-
-    return this.circuitBreaker.execute(async () => {
-      return retry(
+    await this.limiter.acquire();
+    return this.breaker.execute(() =>
+      retry(
         async () => {
-          this.logger.debug({ tokenId }, "Fetching order book");
-
-          // In production: const book = await this.client.getOrderBook(tokenId);
-          // For now, return mock or cached data
-          const cached = this.books.get(tokenId);
-          if (cached) {
-            return cached;
-          }
-
-          // Return a default book
-          const book: OrderBook = {
+          // TODO: replace with real SDK call
+          //   const book = await realClient.getOrderBook(tokenId);
+          return {
             tokenId,
-            bestBidPrice: 0.5,
-            bestBidSize: 100,
-            bestAskPrice: 0.51,
-            bestAskSize: 100,
+            bestBidPrice: 0.48,
+            bestBidSize: 200,
+            bestAskPrice: 0.49,
+            bestAskSize: 200,
+            bids: [{ price: 0.48, size: 200 }],
+            asks: [{ price: 0.49, size: 200 }],
             lastUpdatedMs: Date.now(),
-          };
-          this.books.set(tokenId, book);
-          return book;
+          } satisfies OrderBook;
         },
         {
           maxAttempts: 3,
-          initialDelayMs: 100,
-          onRetry: (attempt, error) => {
-            this.logger.warn({ tokenId, attempt, error: error.message }, "Retrying getOrderBook");
+          initialDelayMs: 150,
+          onRetry: (attempt, err, delay) => {
+            if (err.message.includes("429")) this.limiter.recordError(429);
+            logger.warn({ tokenId, attempt, delay }, "Retrying getOrderBook");
           },
         }
-      );
-    });
+      )
+    );
   }
 
   async getMultipleOrderBooks(tokenIds: string[]): Promise<Map<string, OrderBook>> {
     const results = new Map<string, OrderBook>();
-
-    for (const tokenId of tokenIds) {
+    for (const id of tokenIds) {
       try {
-        const book = await this.getOrderBook(tokenId);
-        results.set(tokenId, book);
-      } catch (error) {
-        this.logger.error(
-          { tokenId, error: error instanceof Error ? error.message : String(error) },
-          "Failed to fetch order book"
-        );
-        this.rateLimiter.recordError(500);
+        results.set(id, await this.getOrderBook(id));
+        this.limiter.recordSuccess();
+      } catch (err) {
+        logger.error({ tokenId: id, err: String(err) }, "getOrderBook failed");
+        this.limiter.recordError(500);
       }
     }
-
     return results;
   }
+
+  /* ---- Orders ---- */
 
   async placeOrder(
     tokenId: string,
@@ -106,17 +87,14 @@ export class ClobClient {
     price: number,
     size: number
   ): Promise<Order> {
-    await this.rateLimiter.acquire(2); // Place order is heavier
-
-    return this.circuitBreaker.execute(async () => {
-      return retry(
+    await this.limiter.acquire(2);
+    return this.breaker.execute(() =>
+      retry(
         async () => {
-          this.logger.info({ tokenId, side, price, size }, "Placing order");
-
-          // In production: const order = await this.client.createOrder({...});
-          // For now, create a mock order
+          logger.info({ tokenId, side, price, size }, "Placing order");
+          // TODO: replace with real SDK call
           const order: Order = {
-            id: `order_${Date.now()}_${Math.random()}`,
+            id: `ord_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
             tokenId,
             side,
             price,
@@ -126,92 +104,52 @@ export class ClobClient {
             createdAt: Date.now(),
             updatedAt: Date.now(),
           };
-
-          this.orders.set(order.id, order);
-          this.logger.info({ orderId: order.id }, "Order placed successfully");
           return order;
         },
         {
           maxAttempts: 2,
           initialDelayMs: 200,
-          onRetry: (attempt, error) => {
-            if (error.message.includes("429")) {
-              this.rateLimiter.recordError(429);
-            }
-            this.logger.warn(
-              { tokenId, side, attempt, error: error.message },
-              "Retrying placeOrder"
-            );
+          onRetry: (attempt, err) => {
+            if (err.message.includes("429")) this.limiter.recordError(429);
+            logger.warn({ tokenId, side, attempt }, "Retrying placeOrder");
           },
         }
-      );
-    });
+      )
+    );
   }
 
   async cancelOrder(orderId: string): Promise<void> {
-    await this.rateLimiter.acquire(1);
-
-    return this.circuitBreaker.execute(async () => {
-      return retry(
+    await this.limiter.acquire();
+    await this.breaker.execute(() =>
+      retry(
         async () => {
-          this.logger.info({ orderId }, "Canceling order");
-
-          // In production: await this.client.cancelOrder(orderId);
-          const order = this.orders.get(orderId);
-          if (order) {
-            order.status = "cancelled";
-            order.updatedAt = Date.now();
-          }
-
-          this.logger.info({ orderId }, "Order cancelled");
+          logger.info({ orderId }, "Cancelling order");
+          // TODO: replace with real SDK call
         },
-        {
-          maxAttempts: 2,
-          initialDelayMs: 100,
-        }
-      );
-    });
+        { maxAttempts: 2, initialDelayMs: 100 }
+      )
+    );
   }
 
-  async getOrderStatus(orderId: string): Promise<Order | null> {
-    await this.rateLimiter.acquire(1);
-
-    return this.circuitBreaker.execute(async () => {
-      return retry(
+  async getOrderStatus(_orderId: string): Promise<Order | null> {
+    await this.limiter.acquire();
+    return this.breaker.execute(() =>
+      retry(
         async () => {
-          this.logger.debug({ orderId }, "Fetching order status");
-
-          // In production: const order = await this.client.getOrder(orderId);
-          return this.orders.get(orderId) || null;
+          // TODO: replace with real SDK call — query order by _orderId
+          return null;
         },
-        {
-          maxAttempts: 3,
-          initialDelayMs: 50,
-        }
-      );
-    });
+        { maxAttempts: 2, initialDelayMs: 100 }
+      )
+    );
   }
 
-  async getPositions(): Promise<Position[]> {
-    await this.rateLimiter.acquire(1);
-
-    return this.circuitBreaker.execute(async () => {
-      return retry(
-        async () => {
-          this.logger.debug("Fetching positions");
-
-          // In production: const positions = await this.client.getPositions();
-          return Array.from(this.positions.values());
-        },
-        {
-          maxAttempts: 3,
-          initialDelayMs: 100,
-        }
-      );
-    });
+  async cancelAllOpenOrders(): Promise<void> {
+    logger.warn("Cancelling ALL open orders via API");
+    // TODO: replace with real SDK call
   }
 
-  getCircuitBreakerState(): string {
-    return this.circuitBreaker.getState();
+  getCircuitBreakerState(): "closed" | "open" | "half-open" {
+    return this.breaker.getState();
   }
 }

@@ -1,98 +1,55 @@
-import pino from "pino";
+import Decimal from "decimal.js";
 import { Position } from "./types.js";
-
-const logger = pino({ name: "Positions" });
 
 export class PositionManager {
   private positions = new Map<string, Position>();
 
-  update(
-    tokenId: string,
-    size: number,
-    price: number,
-    mark?: number
-  ): void {
-    let position = this.positions.get(tokenId);
-
-    if (!position) {
-      position = {
+  /** Add to a position (positive size = buy, negative = sell). */
+  update(tokenId: string, deltaSizeShares: number, price: number): void {
+    const existing = this.positions.get(tokenId);
+    if (!existing) {
+      this.positions.set(tokenId, {
         tokenId,
-        size,
+        size: deltaSizeShares,
         avgPrice: price,
         unrealizedPnL: 0,
         updatedAt: Date.now(),
-      };
+      });
+      return;
+    }
+
+    const oldCost = new Decimal(existing.size).times(existing.avgPrice);
+    const newCost = new Decimal(deltaSizeShares).times(price);
+    const totalSize = new Decimal(existing.size).plus(deltaSizeShares);
+
+    if (totalSize.isZero()) {
+      existing.size = 0;
+      existing.avgPrice = 0;
     } else {
-      // Update average price
-      const totalCost = position.size * position.avgPrice + size * price;
-      const totalSize = position.size + size;
-
-      if (totalSize !== 0) {
-        position.avgPrice = totalCost / totalSize;
-        position.size = totalSize;
-      } else {
-        position.size = 0;
-        position.avgPrice = 0;
-      }
+      existing.avgPrice = oldCost.plus(newCost).div(totalSize).toNumber();
+      existing.size = totalSize.toNumber();
     }
-
-    if (mark) {
-      position.unrealizedPnL = position.size * (mark - position.avgPrice);
-    }
-
-    position.updatedAt = Date.now();
-    this.positions.set(tokenId, position);
-
-    logger.debug(
-      { tokenId, size, avgPrice: position.avgPrice, unrealizedPnL: position.unrealizedPnL },
-      "Position updated"
-    );
+    existing.updatedAt = Date.now();
   }
 
   get(tokenId: string): Position | null {
-    return this.positions.get(tokenId) || null;
+    return this.positions.get(tokenId) ?? null;
   }
 
   getAll(): Position[] {
-    return Array.from(this.positions.values());
+    return [...this.positions.values()];
   }
 
-  getExposureUsd(markPrices: Map<string, number>): number {
-    let totalExposure = 0;
-
-    for (const position of this.positions.values()) {
-      const mark = markPrices.get(position.tokenId) || position.avgPrice;
-      totalExposure += Math.abs(position.size * mark);
+  /** Sum of |size * avgPrice| across all positions. */
+  totalExposureUsd(): number {
+    let total = new Decimal(0);
+    for (const p of this.positions.values()) {
+      total = total.plus(new Decimal(Math.abs(p.size)).times(p.avgPrice));
     }
-
-    return totalExposure;
-  }
-
-  getNetExposureUsd(markPrices: Map<string, number>): number {
-    let totalValue = 0;
-
-    for (const position of this.positions.values()) {
-      const mark = markPrices.get(position.tokenId) || position.avgPrice;
-      totalValue += position.size * mark;
-    }
-
-    return totalValue;
-  }
-
-  close(tokenId: string): void {
-    const position = this.positions.get(tokenId);
-    if (position) {
-      position.size = 0;
-      position.unrealizedPnL = 0;
-      position.updatedAt = Date.now();
-    }
+    return total.toNumber();
   }
 
   clear(): void {
     this.positions.clear();
-  }
-
-  size(): number {
-    return this.positions.size;
   }
 }

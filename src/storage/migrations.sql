@@ -1,56 +1,38 @@
-CREATE TABLE IF NOT EXISTS opportunities (
-  id TEXT PRIMARY KEY,
+-- trades table
+CREATE TABLE IF NOT EXISTS trades (
+  id          TEXT PRIMARY KEY,
   market_name TEXT NOT NULL,
-  type TEXT NOT NULL,
-  expected_profit_usd REAL NOT NULL,
+  type        TEXT NOT NULL CHECK (type IN ('complement','multi_outcome')),
+  legs        TEXT NOT NULL,  -- JSON array of {tokenId, price, size, side}
+  total_cost  REAL NOT NULL,
+  expected_profit REAL NOT NULL,
   expected_profit_bps REAL NOT NULL,
-  snapshot JSON NOT NULL,
-  created_at INTEGER NOT NULL,
-  detected_at INTEGER NOT NULL
+  actual_profit REAL,
+  status      TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','filled','partial','hedged','failed')),
+  hedged      INTEGER NOT NULL DEFAULT 0,
+  hedge_loss  REAL NOT NULL DEFAULT 0,
+  created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
-CREATE TABLE IF NOT EXISTS orders (
-  id TEXT PRIMARY KEY,
-  token_id TEXT NOT NULL,
-  side TEXT NOT NULL,
-  price REAL NOT NULL,
-  size REAL NOT NULL,
-  status TEXT NOT NULL,
-  created_at INTEGER NOT NULL,
-  updated_at INTEGER NOT NULL,
-  filled_size REAL DEFAULT 0
+CREATE INDEX IF NOT EXISTS idx_trades_status ON trades(status);
+CREATE INDEX IF NOT EXISTS idx_trades_created ON trades(created_at);
+
+-- daily summary
+CREATE TABLE IF NOT EXISTS daily_stats (
+  date         TEXT PRIMARY KEY,
+  trades_count INTEGER NOT NULL DEFAULT 0,
+  wins         INTEGER NOT NULL DEFAULT 0,
+  losses       INTEGER NOT NULL DEFAULT 0,
+  gross_pnl    REAL NOT NULL DEFAULT 0,
+  fees_paid    REAL NOT NULL DEFAULT 0,
+  net_pnl      REAL NOT NULL DEFAULT 0,
+  max_drawdown REAL NOT NULL DEFAULT 0
 );
 
-CREATE TABLE IF NOT EXISTS fills (
-  id TEXT PRIMARY KEY,
-  order_id TEXT NOT NULL REFERENCES orders(id),
-  token_id TEXT NOT NULL,
-  side TEXT NOT NULL,
-  price REAL NOT NULL,
-  size REAL NOT NULL,
-  fee_usd REAL NOT NULL,
-  created_at INTEGER NOT NULL,
-  UNIQUE(order_id, token_id, price)
+-- configuration snapshots for audit
+CREATE TABLE IF NOT EXISTS config_snapshots (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  config     TEXT NOT NULL,  -- JSON blob
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
-
-CREATE TABLE IF NOT EXISTS positions (
-  token_id TEXT PRIMARY KEY,
-  size REAL NOT NULL,
-  avg_price REAL NOT NULL,
-  unrealized_pnl REAL NOT NULL,
-  updated_at INTEGER NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS events (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  level TEXT NOT NULL,
-  message TEXT NOT NULL,
-  context JSON,
-  created_at INTEGER NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_opportunities_created ON opportunities(created_at);
-CREATE INDEX IF NOT EXISTS idx_opportunities_market ON opportunities(market_name);
-CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
-CREATE INDEX IF NOT EXISTS idx_fills_order ON fills(order_id);
-CREATE INDEX IF NOT EXISTS idx_events_created ON events(created_at);

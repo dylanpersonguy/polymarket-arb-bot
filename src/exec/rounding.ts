@@ -1,50 +1,37 @@
 import Decimal from "decimal.js";
 
 /**
- * Rounds a price to the nearest tick
- * Polymarket typically uses 4 decimal places, so tick = 0.0001
+ * Polymarket tick size = 0.01
+ * Prices must be in [0.01 .. 0.99].
  */
-export function roundPrice(price: number, tickSize: number = 0.0001): number {
-  const ticks = new Decimal(price).div(new Decimal(tickSize));
-  const rounded = ticks.round().times(new Decimal(tickSize));
-  return rounded.toNumber();
+export const TICK = 0.01;
+export const MIN_PRICE = 0.01;
+export const MAX_PRICE = 0.99;
+
+/** Round to nearest tick (0.01). */
+export function roundPrice(price: number): number {
+  const d = new Decimal(price).div(TICK).round().times(TICK);
+  return clamp(d.toNumber());
 }
 
-/**
- * Round up (ask prices)
- */
-export function roundPriceUp(price: number, tickSize: number = 0.0001): number {
-  const decimal = new Decimal(price);
-  const ticks = decimal.div(new Decimal(tickSize));
-  const rounded = ticks.ceil().times(new Decimal(tickSize));
-  return rounded.toNumber();
+/** Round UP (conservative for buy-side asks). */
+export function roundPriceUp(price: number): number {
+  const d = new Decimal(price).div(TICK).ceil().times(TICK);
+  return clamp(d.toNumber());
 }
 
-/**
- * Round down (bid prices)
- */
-export function roundPriceDown(price: number, tickSize: number = 0.0001): number {
-  const decimal = new Decimal(price);
-  const ticks = decimal.div(new Decimal(tickSize));
-  const rounded = ticks.floor().times(new Decimal(tickSize));
-  return rounded.toNumber();
+/** Round DOWN (conservative for sell-side bids). */
+export function roundPriceDown(price: number): number {
+  const d = new Decimal(price).div(TICK).floor().times(TICK);
+  return clamp(d.toNumber());
 }
 
-/**
- * Adjust price by N ticks
- */
-export function adjustPriceByTicks(
-  price: number,
-  ticks: number,
-  tickSize: number = 0.0001
-): number {
-  const adjusted = new Decimal(price).plus(new Decimal(ticks).times(new Decimal(tickSize)));
-  return adjusted.toNumber();
+/** Adjust price by ±N ticks. */
+export function adjustByTicks(price: number, ticks: number): number {
+  const d = new Decimal(price).plus(new Decimal(ticks).times(TICK));
+  return clamp(d.toNumber());
 }
 
-/**
- * Clamp price to valid range [0, 1]
- */
-export function clampPrice(price: number): number {
-  return Math.max(0, Math.min(1, price));
+export function clamp(p: number): number {
+  return Math.max(MIN_PRICE, Math.min(MAX_PRICE, p));
 }

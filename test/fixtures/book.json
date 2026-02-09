@@ -1,0 +1,66 @@
+{
+  "yesBook": {
+    "tokenId": "yes-token-1",
+    "bestBidPrice": 0.46,
+    "bestBidSize": 150,
+    "bestAskPrice": 0.47,
+    "bestAskSize": 300,
+    "bids": [
+      { "price": 0.46, "size": 150 },
+      { "price": 0.45, "size": 200 }
+    ],
+    "asks": [
+      { "price": 0.47, "size": 300 },
+      { "price": 0.48, "size": 200 }
+    ],
+    "lastUpdatedMs": 0
+  },
+  "noBook": {
+    "tokenId": "no-token-1",
+    "bestBidPrice": 0.50,
+    "bestBidSize": 100,
+    "bestAskPrice": 0.51,
+    "bestAskSize": 250,
+    "bids": [
+      { "price": 0.50, "size": 100 },
+      { "price": 0.49, "size": 200 }
+    ],
+    "asks": [
+      { "price": 0.51, "size": 250 },
+      { "price": 0.52, "size": 200 }
+    ],
+    "lastUpdatedMs": 0
+  },
+  "multiBooks": [
+    {
+      "tokenId": "outcome-a",
+      "bestBidPrice": 0.28,
+      "bestBidSize": 100,
+      "bestAskPrice": 0.30,
+      "bestAskSize": 200,
+      "bids": [{ "price": 0.28, "size": 100 }],
+      "asks": [{ "price": 0.30, "size": 200 }],
+      "lastUpdatedMs": 0
+    },
+    {
+      "tokenId": "outcome-b",
+      "bestBidPrice": 0.28,
+      "bestBidSize": 100,
+      "bestAskPrice": 0.29,
+      "bestAskSize": 200,
+      "bids": [{ "price": 0.28, "size": 100 }],
+      "asks": [{ "price": 0.29, "size": 200 }],
+      "lastUpdatedMs": 0
+    },
+    {
+      "tokenId": "outcome-c",
+      "bestBidPrice": 0.30,
+      "bestBidSize": 100,
+      "bestAskPrice": 0.31,
+      "bestAskSize": 200,
+      "bids": [{ "price": 0.30, "size": 100 }],
+      "asks": [{ "price": 0.31, "size": 200 }],
+      "lastUpdatedMs": 0
+    }
+  ]
+}

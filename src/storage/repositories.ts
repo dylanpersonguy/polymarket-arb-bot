@@ -1,134 +1,149 @@
-import pino from "pino";
 import Database from "better-sqlite3";
-import { Opportunity } from "../arb/opportunity.js";
-import { Order } from "../clob/types.js";
+import { getDb } from "./db.js";
 
-const logger = pino({ name: "Repositories" });
+export interface TradeRow {
+  id: string;
+  market_name: string;
+  type: string;
+  legs: string;
+  total_cost: number;
+  expected_profit: number;
+  expected_profit_bps: number;
+  actual_profit: number | null;
+  status: string;
+  hedged: number;
+  hedge_loss: number;
+  created_at: string;
+  updated_at: string;
+}
 
-export class OpportunitiesRepository {
-  constructor(private db: Database.Database) {}
+export interface DailyStatsRow {
+  date: string;
+  trades_count: number;
+  wins: number;
+  losses: number;
+  gross_pnl: number;
+  fees_paid: number;
+  net_pnl: number;
+  max_drawdown: number;
+}
 
-  insert(opp: Opportunity): void {
-    try {
-      const stmt = this.db.prepare(`
-        INSERT INTO opportunities (id, market_name, type, expected_profit_usd, expected_profit_bps, snapshot, created_at, detected_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-      `);
+export class TradeRepository {
+  private db: Database.Database;
+  private insertStmt: Database.Statement;
+  private updateStatusStmt: Database.Statement;
 
-      stmt.run(
-        `${opp.type}_${opp.detectedAt}`,
-        opp.marketName,
-        opp.type,
-        opp.expectedProfit,
-        opp.expectedProfitBps,
-        JSON.stringify(opp),
-        Date.now(),
-        opp.detectedAt
-      );
-    } catch (error) {
-      logger.error({ error, opportunity: opp }, "Failed to insert opportunity");
-    }
+  constructor(dbPath?: string) {
+    this.db = getDb(dbPath);
+    this.insertStmt = this.db.prepare(`
+      INSERT INTO trades (id, market_name, type, legs, total_cost, expected_profit, expected_profit_bps, status)
+      VALUES (@id, @market_name, @type, @legs, @total_cost, @expected_profit, @expected_profit_bps, @status)
+    `);
+    this.updateStatusStmt = this.db.prepare(`
+      UPDATE trades SET status = @status, actual_profit = @actual_profit, hedged = @hedged,
+        hedge_loss = @hedge_loss, updated_at = datetime('now')
+      WHERE id = @id
+    `);
   }
 
-  getRecent(limitDays: number = 7): Opportunity[] {
-    try {
-      const stmt = this.db.prepare(`
-        SELECT snapshot FROM opportunities 
-        WHERE created_at > ? 
-        ORDER BY created_at DESC 
-        LIMIT 1000
-      `);
+  insert(trade: {
+    id: string;
+    marketName: string;
+    type: string;
+    legs: object[];
+    totalCost: number;
+    expectedProfit: number;
+    expectedProfitBps: number;
+  }): void {
+    this.insertStmt.run({
+      id: trade.id,
+      market_name: trade.marketName,
+      type: trade.type,
+      legs: JSON.stringify(trade.legs),
+      total_cost: trade.totalCost,
+      expected_profit: trade.expectedProfit,
+      expected_profit_bps: trade.expectedProfitBps,
+      status: "pending",
+    });
+  }
 
-      const cutoff = Date.now() - limitDays * 24 * 60 * 60 * 1000;
-      const rows = stmt.all(cutoff) as Array<{ snapshot: string }>;
+  updateStatus(
+    id: string,
+    status: string,
+    actualProfit: number | null = null,
+    hedged = false,
+    hedgeLoss = 0
+  ): void {
+    this.updateStatusStmt.run({
+      id,
+      status,
+      actual_profit: actualProfit,
+      hedged: hedged ? 1 : 0,
+      hedge_loss: hedgeLoss,
+    });
+  }
 
-      return rows.map((r) => JSON.parse(r.snapshot) as Opportunity);
-    } catch (error) {
-      logger.error({ error }, "Failed to get recent opportunities");
-      return [];
-    }
+  getRecent(limit = 50): TradeRow[] {
+    return this.db
+      .prepare("SELECT * FROM trades ORDER BY created_at DESC LIMIT ?")
+      .all(limit) as TradeRow[];
+  }
+
+  getByStatus(status: string): TradeRow[] {
+    return this.db
+      .prepare("SELECT * FROM trades WHERE status = ?")
+      .all(status) as TradeRow[];
+  }
+
+  countToday(): number {
+    const row = this.db
+      .prepare("SELECT COUNT(*) as cnt FROM trades WHERE date(created_at) = date('now')")
+      .get() as { cnt: number };
+    return row.cnt;
   }
 }
 
-export class OrdersRepository {
-  constructor(private db: Database.Database) {}
+export class DailyStatsRepository {
+  private db: Database.Database;
 
-  insert(order: Order): void {
-    try {
-      const stmt = this.db.prepare(`
-        INSERT OR REPLACE INTO orders (id, token_id, side, price, size, status, filled_size, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `);
-
-      stmt.run(
-        order.id,
-        order.tokenId,
-        order.side,
-        order.price,
-        order.size,
-        order.status,
-        order.filledSize,
-        order.createdAt,
-        order.updatedAt
-      );
-    } catch (error) {
-      logger.error({ error, order }, "Failed to insert order");
-    }
+  constructor(dbPath?: string) {
+    this.db = getDb(dbPath);
   }
 
-  updateStatus(orderId: string, status: string, filledSize?: number): void {
-    try {
-      const stmt = this.db.prepare(`
-        UPDATE orders SET status = ?, updated_at = ? ${filledSize !== undefined ? ", filled_size = ?" : ""}
-        WHERE id = ?
-      `);
-
-      const params = filledSize !== undefined ? [status, Date.now(), filledSize, orderId] : [status, Date.now(), orderId];
-      stmt.run(...params);
-    } catch (error) {
-      logger.error({ error, orderId }, "Failed to update order status");
-    }
+  upsert(stats: DailyStatsRow): void {
+    this.db
+      .prepare(
+        `INSERT INTO daily_stats (date, trades_count, wins, losses, gross_pnl, fees_paid, net_pnl, max_drawdown)
+         VALUES (@date, @trades_count, @wins, @losses, @gross_pnl, @fees_paid, @net_pnl, @max_drawdown)
+         ON CONFLICT(date) DO UPDATE SET
+           trades_count = @trades_count, wins = @wins, losses = @losses,
+           gross_pnl = @gross_pnl, fees_paid = @fees_paid, net_pnl = @net_pnl, max_drawdown = @max_drawdown`
+      )
+      .run(stats);
   }
 
-  getOpen(): Order[] {
-    try {
-      const stmt = this.db.prepare(`SELECT * FROM orders WHERE status = 'open'`);
-      return stmt.all() as Order[];
-    } catch (error) {
-      logger.error({ error }, "Failed to get open orders");
-      return [];
-    }
+  getToday(): DailyStatsRow | null {
+    const today = new Date().toISOString().slice(0, 10);
+    return (this.db.prepare("SELECT * FROM daily_stats WHERE date = ?").get(today) as DailyStatsRow) ?? null;
+  }
+
+  getRange(from: string, to: string): DailyStatsRow[] {
+    return this.db
+      .prepare("SELECT * FROM daily_stats WHERE date BETWEEN ? AND ? ORDER BY date")
+      .all(from, to) as DailyStatsRow[];
   }
 }
 
-export class EventsRepository {
-  constructor(private db: Database.Database) {}
+export class ConfigSnapshotRepository {
+  private db: Database.Database;
 
-  insert(level: string, message: string, context?: Record<string, unknown>): void {
-    try {
-      const stmt = this.db.prepare(`
-        INSERT INTO events (level, message, context, created_at)
-        VALUES (?, ?, ?, ?)
-      `);
-
-      stmt.run(level, message, context ? JSON.stringify(context) : null, Date.now());
-    } catch (error) {
-      logger.error({ error }, "Failed to insert event");
-    }
+  constructor(dbPath?: string) {
+    this.db = getDb(dbPath);
   }
 
-  getRecent(limit: number = 100): Array<{ level: string; message: string; created_at: number }> {
-    try {
-      const stmt = this.db.prepare(`
-        SELECT level, message, created_at FROM events 
-        ORDER BY created_at DESC 
-        LIMIT ?
-      `);
-
-      return stmt.all(limit) as Array<{ level: string; message: string; created_at: number }>;
-    } catch (error) {
-      logger.error({ error }, "Failed to get recent events");
-      return [];
-    }
+  save(config: object): void {
+    this.db
+      .prepare("INSERT INTO config_snapshots (config) VALUES (?)")
+      .run(JSON.stringify(config));
   }
 }

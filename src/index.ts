@@ -1,200 +1,296 @@
 import pino from "pino";
+import { loadConfig, loadMarkets, loadEnv } from "./config/load.js";
+import type { Env, Config, Market, MarketBinary, MarketMulti } from "./config/schema.js";
 import { ClobClient } from "./clob/client.js";
-import { loadEnv, loadConfig, loadMarkets } from "./config/load.js";
 import { OrderBookManager } from "./clob/books.js";
+import { OrderManager } from "./clob/orders.js";
+import { PositionManager } from "./clob/positions.js";
 import { detectBinaryComplementArb } from "./arb/complement.js";
 import { detectMultiOutcomeArb } from "./arb/multiOutcome.js";
-import { Opportunity } from "./arb/opportunity.js";
+import { bestOpportunity, filterByMinProfitBps } from "./arb/filters.js";
+import { Opportunity, oppSummary, isComplement } from "./arb/opportunity.js";
 import { RiskManager } from "./exec/risk.js";
-import { Executor } from "./exec/executor.js";
+import { Executor, ExecutionResult } from "./exec/executor.js";
+import { PaperBroker } from "./sim/paperBroker.js";
 import { TelegramNotifier } from "./monitoring/telegram.js";
 import { HealthMonitor } from "./monitoring/health.js";
-import { MetricsCollector } from "./monitoring/metrics.js";
-import { initializeDatabase } from "./storage/db.js";
-import { OpportunitiesRepository } from "./storage/repositories.js";
+import { Metrics } from "./monitoring/metrics.js";
+import { TradeRepository, ConfigSnapshotRepository } from "./storage/repositories.js";
+import { closeDb } from "./storage/db.js";
 import { sleep } from "./utils/sleep.js";
-import { Market } from "./config/schema.js";
 
-const logger = pino({ name: "Bot" });
+const logger = pino({ name: "Main" });
 
-interface MarketInfo {
-  market: Market;
-  tokenIds: string[];
+function isBinary(m: Market): m is MarketBinary {
+  return m.kind === "binary";
+}
+function isMulti(m: Market): m is MarketMulti {
+  return m.kind === "multi";
 }
 
-async function main(): Promise<void> {
-  // Load configuration
-  const env = loadEnv();
-  const config = loadConfig();
-  const markets = loadMarkets(config.marketsFile);
+export async function main(): Promise<void> {
+  /* ---- Load env & config ---- */
+  const env: Env = loadEnv();
+  const cfg: Config = loadConfig();
+  const markets: Market[] = loadMarkets();
 
-  logger.info({ mode: env.MODE, markets: markets.length }, "Starting bot");
+  const mode = env.MODE; // "dry" | "paper" | "live"
 
-  // Initialize services
-  const client = new ClobClient(env);
-  await client.initialize();
+  logger.info({ mode, markets: markets.length }, "Starting PolyArb bot");
 
-  const bookManager = new OrderBookManager(2000);
-  const riskManager = new RiskManager({
-    maxExposureUsd: config.maxExposureUsd,
-    perMarketMaxUsd: config.perMarketMaxUsd,
-    dailyStopLossUsd: config.dailyStopLossUsd,
-    cooldownMs: config.cooldownMs,
+  /* ---- Wire up services ---- */
+  const clobClient = new ClobClient({
+    POLYMARKET_PRIVATE_KEY: env.POLYMARKET_PRIVATE_KEY,
+    MODE: env.MODE,
+    LOG_LEVEL: env.LOG_LEVEL,
+    KILL_SWITCH: env.KILL_SWITCH,
   });
 
-  const executor = new Executor(client, riskManager, {
-    orderTimeoutMs: config.orderTimeoutMs,
-    priceImprovementTicks: config.priceImprovementTicks,
-    enableLiveTrading: config.enableLiveTrading,
-    mode: env.MODE,
+  const bookMgr = new OrderBookManager(cfg.pollingIntervalMs * 2 + 200);
+  const orderMgr = new OrderManager();
+  const positionMgr = new PositionManager();
+
+  const riskMgr = new RiskManager({
+    maxExposureUsd: cfg.maxExposureUsd,
+    perMarketMaxUsd: cfg.perMarketMaxUsd,
+    dailyStopLossUsd: cfg.dailyStopLossUsd,
+    cooldownMs: cfg.cooldownMs,
+    maxOpenOrders: cfg.maxOpenOrders,
+    safeModeErrorThreshold: cfg.safeModeErrorThreshold,
   });
+
+  const executor = new Executor(clobClient, riskMgr, {
+    orderTimeoutMs: cfg.orderTimeoutMs,
+    priceImprovementTicks: cfg.priceImprovementTicks,
+    enableLiveTrading: cfg.enableLiveTrading,
+    mode,
+  });
+
+  const paperBroker = mode === "paper" ? new PaperBroker() : null;
 
   const telegram = new TelegramNotifier({
-    botToken: env.TELEGRAM_BOT_TOKEN || "",
-    chatId: env.TELEGRAM_CHAT_ID || "",
-    enabled: config.enableTelegram && !!env.TELEGRAM_BOT_TOKEN && !!env.TELEGRAM_CHAT_ID,
+    botToken: env.TELEGRAM_BOT_TOKEN ?? "",
+    chatId: env.TELEGRAM_CHAT_ID ?? "",
+    enabled: !!(env.TELEGRAM_BOT_TOKEN && env.TELEGRAM_CHAT_ID),
   });
 
-  const healthMonitor = new HealthMonitor();
-  const metrics = new MetricsCollector();
-  const db = initializeDatabase();
-  const oppRepo = new OpportunitiesRepository(db);
+  const health = new HealthMonitor();
+  const metrics = new Metrics();
 
-  // Parse markets
-  const marketInfos: MarketInfo[] = markets.map((market) => {
-    let tokenIds: string[] = [];
-    if (market.kind === "binary") {
-      tokenIds = [market.yesTokenId, market.noTokenId];
-    } else {
-      tokenIds = market.outcomes.map((o) => o.tokenId);
-    }
-    return { market, tokenIds };
-  });
-
-  // Main loop
-  let lastCheckMs = 0;
-
-  while (true) {
-    // Check kill switch
-    if (riskManager.isKillSwitchActive()) {
-      logger.error("Kill switch detected, stopping all trading");
-      await telegram.sendKillSwitch();
-      break;
-    }
-
-    // Health check: reset daily metrics at midnight
-    const now = Date.now();
-    const midnight = new Date(now);
-    midnight.setHours(24, 0, 0, 0);
-    if (now > midnight.getTime()) {
-      riskManager.resetDaily();
-      metrics.reset();
-    }
-
+  // Persistence — only init in non-dry mode
+  let tradeRepo: TradeRepository | null = null;
+  let configRepo: ConfigSnapshotRepository | null = null;
+  if (mode !== "dry") {
     try {
-      // Poll order books
-      if (now - lastCheckMs > config.pollingIntervalMs) {
-        const allTokenIds = new Set<string>();
-        for (const info of marketInfos) {
-          for (const tokenId of info.tokenIds) {
-            allTokenIds.add(tokenId);
-          }
-        }
-
-        const books = await client.getMultipleOrderBooks(Array.from(allTokenIds));
-        for (const [tokenId, book] of books) {
-          bookManager.set(tokenId, book);
-        }
-
-        // Detect opportunities
-        const opportunities: Opportunity[] = [];
-
-        for (const info of marketInfos) {
-          if (info.market.kind === "binary") {
-            const yesBook = bookManager.get(info.market.yesTokenId);
-            const noBook = bookManager.get(info.market.noTokenId);
-
-            const opp = detectBinaryComplementArb(info.market.name, yesBook, noBook, {
-              feeBps: config.feeBps,
-              slippageBps: config.slippageBps,
-              minProfit: config.minProfit,
-              maxExposureUsd: config.maxExposureUsd,
-              minTopSizeUsd: config.minTopSizeUsd,
-            });
-
-            if (opp) {
-              opportunities.push(opp);
-              metrics.recordOpportunityDetected(opp.expectedProfitBps);
-            }
-          } else {
-            const outcomeBooks = new Map<string, string>();
-            const bookMap = new Map<string, any>();
-
-            for (const outcome of info.market.outcomes) {
-              const book = bookManager.get(outcome.tokenId);
-              if (book) {
-                outcomeBooks.set(outcome.tokenId, outcome.label);
-                bookMap.set(outcome.tokenId, book);
-              }
-            }
-
-            if (bookMap.size === info.market.outcomes.length) {
-              const opp = detectMultiOutcomeArb(info.market.name, bookMap, outcomeBooks, {
-                feeBps: config.feeBps,
-                slippageBps: config.slippageBps,
-                minProfit: config.minProfit,
-                maxExposureUsd: config.maxExposureUsd,
-                minTopSizeUsd: config.minTopSizeUsd,
-              });
-
-              if (opp) {
-                opportunities.push(opp);
-                metrics.recordOpportunityDetected(opp.expectedProfitBps);
-              }
-            }
-          }
-        }
-
-        // Execute opportunities (limited to 1-2 concurrent)
-        if (opportunities.length > 0) {
-          logger.info({ count: opportunities.length }, "Opportunities detected");
-
-          for (const opp of opportunities.slice(0, 2)) {
-            const books = bookManager.getAll();
-            const result = await executor.executeOpportunity(opp, books);
-
-            if (result.success) {
-              metrics.recordOpportunityExecuted();
-              if (result.realized) {
-                metrics.recordTradeSuccess(opp.expectedProfit);
-              }
-              await telegram.sendOpportunity(opp.marketName, opp.expectedProfit, opp.expectedProfitBps);
-            } else {
-              if (result.loss) {
-                metrics.recordTradeFailed(result.loss);
-              }
-            }
-
-            oppRepo.insert(opp);
-          }
-        }
-
-        healthMonitor.recordSuccess();
-        lastCheckMs = now;
-      }
-    } catch (error) {
-      logger.error({ error }, "Error in main loop");
-      healthMonitor.recordError();
-      await telegram.sendError(error instanceof Error ? error.message : String(error));
+      tradeRepo = new TradeRepository();
+      configRepo = new ConfigSnapshotRepository();
+      configRepo.save(cfg);
+    } catch (err) {
+      logger.warn({ err: String(err) }, "DB init failed — running without persistence");
     }
-
-    await sleep(100);
   }
 
-  db.close();
-}
+  /* ---- Graceful shutdown ---- */
+  let running = true;
+  const shutdown = async () => {
+    logger.info("Shutting down…");
+    running = false;
 
-main().catch((error) => {
-  logger.error({ error }, "Fatal error");
-  process.exit(1);
-});
+    // Cancel all open orders locally
+    orderMgr.cancelAll();
+
+    metrics.log();
+    closeDb();
+    process.exit(0);
+  };
+
+  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", shutdown);
+
+  /* ---- Main loop ---- */
+  let loopCount = 0;
+  const METRICS_LOG_INTERVAL = 60; // log metrics every N loops
+
+  while (running) {
+    health.markLoopStart();
+    loopCount++;
+
+    try {
+      // 1. Refresh order books for all token IDs
+      for (const market of markets) {
+        const tokenIds: string[] = isBinary(market)
+          ? [market.yesTokenId, market.noTokenId]
+          : market.outcomes.map((o) => o.tokenId);
+
+        for (const tid of tokenIds) {
+          try {
+            const book = await clobClient.getOrderBook(tid);
+            if (book) bookMgr.set(tid, book);
+          } catch (err) {
+            logger.debug({ tokenId: tid, err: String(err) }, "Book fetch failed");
+          }
+        }
+      }
+
+      const freshBooks = bookMgr.getAll();
+      metrics.gauge("fresh_books", freshBooks.size);
+
+      // 2. Detect opportunities across all markets
+      const opps: Opportunity[] = [];
+
+      for (const market of markets) {
+        if (isBinary(market)) {
+          const yesBook = bookMgr.get(market.yesTokenId);
+          const noBook = bookMgr.get(market.noTokenId);
+          if (yesBook && noBook) {
+            const opp = detectBinaryComplementArb(market.name, yesBook, noBook, {
+              feeBps: cfg.feeBps,
+              slippageBps: cfg.slippageBps,
+              minProfit: cfg.minProfit,
+              maxExposureUsd: cfg.maxExposureUsd,
+              perMarketMaxUsd: cfg.perMarketMaxUsd,
+              minTopSizeUsd: cfg.minTopSizeUsd,
+              stalenessMs: cfg.pollingIntervalMs * 2 + 200,
+              currentGlobalExposureUsd: positionMgr.totalExposureUsd(),
+            });
+            if (opp) opps.push(opp);
+          }
+        } else if (isMulti(market)) {
+          const booksMap = new Map<string, import("./clob/types.js").OrderBook>();
+          const labelsMap = new Map<string, string>();
+          for (const o of market.outcomes) {
+            const b = bookMgr.get(o.tokenId);
+            if (b) {
+              booksMap.set(o.tokenId, b);
+              labelsMap.set(o.tokenId, o.label);
+            }
+          }
+
+          if (booksMap.size === market.outcomes.length) {
+            const opp = detectMultiOutcomeArb(market.name, booksMap, labelsMap, {
+              feeBps: cfg.feeBps,
+              slippageBps: cfg.slippageBps,
+              minProfit: cfg.minProfit,
+              maxExposureUsd: cfg.maxExposureUsd,
+              perMarketMaxUsd: cfg.perMarketMaxUsd,
+              minTopSizeUsd: cfg.minTopSizeUsd,
+              stalenessMs: cfg.pollingIntervalMs * 2 + 200,
+              currentGlobalExposureUsd: positionMgr.totalExposureUsd(),
+            });
+            if (opp) opps.push(opp);
+          }
+        }
+      }
+
+      metrics.inc("scan_cycles");
+
+      // 3. Filter & pick best
+      const qualified = filterByMinProfitBps(opps, cfg.minProfit * 10_000);
+      const best = bestOpportunity(qualified);
+
+      if (best) {
+        metrics.inc("opportunities_found");
+        logger.info({ opp: oppSummary(best) }, "Opportunity found");
+
+        // 4. Execute
+        let execResult: ExecutionResult;
+
+        if (mode === "paper" && paperBroker) {
+          // Paper mode: simulate fill
+          const legs = isComplement(best)
+              ? [
+                  { tokenId: best.yesTokenId, size: best.targetSizeShares },
+                  { tokenId: best.noTokenId, size: best.targetSizeShares },
+                ]
+              : best.legs.map((l: { tokenId: string }) => ({ tokenId: l.tokenId, size: best.targetSizeShares }));
+
+          const { totalCost, trades } = paperBroker.simulateArbBuy(legs, freshBooks);
+
+          execResult = {
+            success: trades.length > 0,
+            tradeId: best.tradeId,
+            legsAttempted: legs.length,
+            legsFilled: trades.length,
+            hedged: false,
+            lossUsd: 0,
+          };
+
+          metrics.inc("paper_trades");
+          logger.info({ totalCost, trades: trades.length }, "Paper trade executed");
+        } else {
+          execResult = await executor.execute(best, freshBooks);
+        }
+
+        // 5. Record
+        if (tradeRepo) {
+          try {
+            tradeRepo.insert({
+              id: best.tradeId,
+              marketName: best.marketName,
+              type: best.type,
+              legs: isComplement(best)
+                  ? [
+                      { tokenId: best.yesTokenId, side: "buy", price: best.askYes },
+                      { tokenId: best.noTokenId, side: "buy", price: best.askNo },
+                    ]
+                  : best.legs,
+              totalCost: best.allInCost,
+              expectedProfit: best.expectedProfit,
+              expectedProfitBps: best.expectedProfitBps,
+            });
+
+            tradeRepo.updateStatus(
+              best.tradeId,
+              execResult.success ? "filled" : "failed",
+              execResult.success ? best.expectedProfit : -execResult.lossUsd,
+              execResult.hedged,
+              execResult.lossUsd
+            );
+          } catch (err) {
+            logger.warn({ err: String(err) }, "Failed to persist trade");
+          }
+        }
+
+        // 6. Notify
+        if (execResult.success) {
+          metrics.inc("successful_trades");
+          await telegram.notifyTrade(
+            execResult.tradeId,
+            best.marketName,
+            best.expectedProfit,
+            execResult.legsFilled
+          );
+        } else {
+          metrics.inc("failed_trades");
+          if (execResult.hedged) {
+            metrics.inc("hedged_trades");
+            metrics.observe("hedge_loss", execResult.lossUsd);
+          }
+          if (execResult.error) {
+            await telegram.notifyError("Execution", execResult.error);
+          }
+        }
+      }
+    } catch (err) {
+      metrics.inc("loop_errors");
+      logger.error({ err: String(err) }, "Main loop error");
+      riskMgr.recordError();
+    }
+
+    health.markLoopEnd();
+
+    // Periodic metrics log
+    if (loopCount % METRICS_LOG_INTERVAL === 0) {
+      metrics.gauge("memory_mb", Math.round(process.memoryUsage().rss / 1024 / 1024));
+      metrics.gauge("open_orders", orderMgr.openCount());
+      metrics.gauge("exposure_usd", positionMgr.totalExposureUsd());
+      if (paperBroker) {
+        metrics.gauge("paper_pnl", paperBroker.realizedPnl);
+      }
+      metrics.log();
+    }
+
+    // Pause between scans
+    await sleep(cfg.pollingIntervalMs);
+  }
+}

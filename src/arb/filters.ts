@@ -1,46 +1,31 @@
 import { Opportunity } from "./opportunity.js";
 
-export function filterByProfit(opportunities: Opportunity[], minProfitBps: number): Opportunity[] {
-  return opportunities.filter((opp) => opp.expectedProfitBps >= minProfitBps);
+/** Keep only opportunities above a profit threshold. */
+export function filterByMinProfitBps(opps: Opportunity[], minBps: number): Opportunity[] {
+  return opps.filter((o) => o.expectedProfitBps >= minBps);
 }
 
-export function filterByMarketName(opportunities: Opportunity[], name: string): Opportunity[] {
-  return opportunities.filter((opp) => opp.marketName === name);
+/** Sort best-first. */
+export function sortByProfit(opps: Opportunity[]): Opportunity[] {
+  return [...opps].sort((a, b) => b.expectedProfitBps - a.expectedProfitBps);
 }
 
-export function filterByTokenId(
-  opportunities: Opportunity[],
-  tokenId: string
-): Opportunity[] {
-  return opportunities.filter((opp) => {
+/** Pick the single best opportunity. */
+export function bestOpportunity(opps: Opportunity[]): Opportunity | null {
+  if (opps.length === 0) return null;
+  return opps.reduce((best, cur) => (cur.expectedProfitBps > best.expectedProfitBps ? cur : best));
+}
+
+/** Collect every tokenId referenced by a set of opportunities. */
+export function collectTokenIds(opps: Opportunity[]): Set<string> {
+  const ids = new Set<string>();
+  for (const opp of opps) {
     if (opp.type === "binary_complement") {
-      return opp.yesTokenId === tokenId || opp.noTokenId === tokenId;
+      ids.add(opp.yesTokenId);
+      ids.add(opp.noTokenId);
     } else {
-      return opp.outcomes.some((o) => o.tokenId === tokenId);
-    }
-  });
-}
-
-export function getBestOpportunity(opportunities: Opportunity[]): Opportunity | null {
-  if (opportunities.length === 0) return null;
-  return opportunities.reduce((best, current) =>
-    current.expectedProfitBps > best.expectedProfitBps ? current : best
-  );
-}
-
-export function aggregateTokenIds(opportunities: Opportunity[]): Set<string> {
-  const tokenIds = new Set<string>();
-
-  for (const opp of opportunities) {
-    if (opp.type === "binary_complement") {
-      tokenIds.add(opp.yesTokenId);
-      tokenIds.add(opp.noTokenId);
-    } else {
-      for (const outcome of opp.outcomes) {
-        tokenIds.add(outcome.tokenId);
-      }
+      for (const leg of opp.legs) ids.add(leg.tokenId);
     }
   }
-
-  return tokenIds;
+  return ids;
 }

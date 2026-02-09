@@ -1,122 +1,111 @@
 import { OrderBook } from "../clob/types.js";
-import {
-  calculateMultiOutcomeCost,
-  calculateExpectedProfit,
-  usdToShares,
-} from "./math.js";
+import { computeCostBreakdown, computeOptimalSize } from "./math.js";
+
+export interface MultiOutcomeLeg {
+  label: string;
+  tokenId: string;
+  askPrice: number;
+  bidPrice: number;
+  askSize: number;
+}
 
 export interface MultiOutcomeOpportunity {
   type: "multi_outcome";
+  tradeId: string;
   marketName: string;
-  outcomes: Array<{
-    label: string;
-    tokenId: string;
-    ask: number;
-    bid: number;
-    size: number;
-  }>;
+  legs: MultiOutcomeLeg[];
   totalCost: number;
-  expectedProfit: number;
-  expectedProfitBps: number;
-  targetSize: number;
   feeCost: number;
   slippageCost: number;
+  allInCost: number;
+  expectedProfit: number;
+  expectedProfitBps: number;
+  targetSizeShares: number;
   detectedAt: number;
 }
 
+export interface MultiDetectorConfig {
+  feeBps: number;
+  slippageBps: number;
+  minProfit: number;
+  maxExposureUsd: number;
+  perMarketMaxUsd: number;
+  minTopSizeUsd: number;
+  stalenessMs: number;
+  currentGlobalExposureUsd?: number;
+}
+
+/**
+ * Detect multi-outcome arbitrage.
+ *
+ * If the sum of all outcome ask prices + fees + slippage < 1.0 we can buy one
+ * share of every outcome for a guaranteed payout of $1 on resolution.
+ */
 export function detectMultiOutcomeArb(
   marketName: string,
   books: Map<string, OrderBook>,
-  labels: Map<string, string>, // tokenId -> label
-  config: {
-    feeBps: number;
-    slippageBps: number;
-    minProfit: number;
-    maxExposureUsd: number;
-    minTopSizeUsd: number;
-  }
+  labels: Map<string, string>,
+  cfg: MultiDetectorConfig
 ): MultiOutcomeOpportunity | null {
-  if (books.size < 2) {
-    return null;
-  }
+  if (books.size < 2) return null;
 
-  // Check freshness
   const now = Date.now();
-  const maxAgeMs = 2000;
-  for (const book of books.values()) {
-    if (now - book.lastUpdatedMs > maxAgeMs) {
-      return null;
-    }
-  }
-
-  const outcomes: Array<{
-    label: string;
-    tokenId: string;
-    ask: number;
-    bid: number;
-    size: number;
-  }> = [];
-
-  let totalCost = 0;
-  let minSize = Infinity;
-  let minUsd = Infinity;
+  const legs: MultiOutcomeLeg[] = [];
+  const askPrices: number[] = [];
+  const askSizes: number[] = [];
 
   for (const [tokenId, book] of books) {
-    const ask = book.bestAskPrice;
-    const size = book.bestAskSize;
-    const usd = size * ask;
+    if (now - book.lastUpdatedMs > cfg.stalenessMs) return null;
 
-    totalCost += ask;
-    minSize = Math.min(minSize, size);
-    minUsd = Math.min(minUsd, usd);
-
-    outcomes.push({
-      label: labels.get(tokenId) || tokenId,
+    const leg: MultiOutcomeLeg = {
+      label: labels.get(tokenId) ?? tokenId,
       tokenId,
-      ask,
-      bid: book.bestBidPrice,
-      size,
-    });
+      askPrice: book.bestAskPrice,
+      bidPrice: book.bestBidPrice,
+      askSize: book.bestAskSize,
+    };
+
+    // Check min USD size on this leg
+    if (leg.askPrice * leg.askSize < cfg.minTopSizeUsd) return null;
+
+    legs.push(leg);
+    askPrices.push(leg.askPrice);
+    askSizes.push(leg.askSize);
   }
 
-  // Check raw cost
-  if (totalCost >= 1.0) {
-    return null;
-  }
+  // Quick reject
+  const rawSum = askPrices.reduce((a, b) => a + b, 0);
+  if (rawSum >= 1.0) return null;
 
-  // Calculate fees and slippage
-  const asks = outcomes.map((o) => o.ask);
-  const { feeCost, slippageCost } = calculateMultiOutcomeCost(asks, config.feeBps, config.slippageBps);
+  // Full cost breakdown
+  const bd = computeCostBreakdown(askPrices, cfg.feeBps, cfg.slippageBps);
+  if (bd.expectedProfit < cfg.minProfit) return null;
 
-  const expectedProfit = calculateExpectedProfit(totalCost, feeCost, slippageCost);
+  // Sizing
+  const remaining = Math.max(0, cfg.maxExposureUsd - (cfg.currentGlobalExposureUsd ?? 0));
+  const targetShares = computeOptimalSize(
+    askPrices,
+    askSizes,
+    cfg.feeBps,
+    cfg.slippageBps,
+    cfg.perMarketMaxUsd,
+    remaining
+  );
 
-  // Check profitability
-  if (expectedProfit < config.minProfit) {
-    return null;
-  }
-
-  // Check liquidity
-  const avgPrice = totalCost / outcomes.length;
-  const targetSize = usdToShares(config.maxExposureUsd / outcomes.length, avgPrice);
-
-  if (minSize < targetSize * 0.5) {
-    return null;
-  }
-
-  if (minUsd < config.minTopSizeUsd) {
-    return null;
-  }
+  if (targetShares <= 0) return null;
 
   return {
     type: "multi_outcome",
+    tradeId: `multi_${now}_${Math.random().toString(36).slice(2, 8)}`,
     marketName,
-    outcomes,
-    totalCost,
-    expectedProfit,
-    expectedProfitBps: expectedProfit * 10000,
-    targetSize,
-    feeCost,
-    slippageCost,
+    legs,
+    totalCost: bd.totalCost,
+    feeCost: bd.feeCost,
+    slippageCost: bd.slippageCost,
+    allInCost: bd.allInCost,
+    expectedProfit: bd.expectedProfit,
+    expectedProfitBps: bd.expectedProfitBps,
+    targetSizeShares: targetShares,
     detectedAt: now,
   };
 }

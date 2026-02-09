@@ -1,5 +1,4 @@
 import pino from "pino";
-import https from "https";
 
 const logger = pino({ name: "Telegram" });
 
@@ -9,75 +8,77 @@ export interface TelegramConfig {
   enabled: boolean;
 }
 
+/**
+ * Lightweight Telegram notifier.  Uses the Bot API via fetch.
+ */
 export class TelegramNotifier {
-  private apiUrl: string;
+  private readonly baseUrl: string;
 
-  constructor(private config: TelegramConfig) {
-    this.apiUrl = `https://api.telegram.org/bot${config.botToken}/sendMessage`;
+  constructor(private readonly cfg: TelegramConfig) {
+    this.baseUrl = `https://api.telegram.org/bot${cfg.botToken}`;
   }
 
-  async send(text: string): Promise<void> {
-    if (!this.config.enabled || !this.config.botToken || !this.config.chatId) {
-      return;
-    }
+  get enabled(): boolean {
+    return this.cfg.enabled && !!this.cfg.botToken && !!this.cfg.chatId;
+  }
 
-    return new Promise((resolve) => {
-      const data = JSON.stringify({
-        chat_id: this.config.chatId,
-        text: text.substring(0, 4096), // Telegram limit
-        parse_mode: "HTML",
-      });
+  async sendMessage(text: string, parseMode: "HTML" | "Markdown" = "HTML"): Promise<void> {
+    if (!this.enabled) return;
 
-      const options = {
+    try {
+      const res = await fetch(`${this.baseUrl}/sendMessage`, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Content-Length": Buffer.byteLength(data),
-        },
-      };
-
-      const req = https.request(this.apiUrl, options, (res) => {
-        let body = "";
-        res.on("data", (chunk) => {
-          body += chunk;
-        });
-        res.on("end", () => {
-          if (res.statusCode !== 200) {
-            logger.warn({ statusCode: res.statusCode, response: body }, "Telegram send failed");
-          } else {
-            logger.debug("Telegram message sent");
-          }
-          resolve();
-        });
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          chat_id: this.cfg.chatId,
+          text,
+          parse_mode: parseMode,
+          disable_web_page_preview: true,
+        }),
       });
 
-      req.on("error", (error) => {
-        logger.error({ error }, "Telegram request error");
-        resolve();
-      });
-
-      req.write(data);
-      req.end();
-    });
+      if (!res.ok) {
+        const body = await res.text();
+        logger.warn({ status: res.status, body }, "Telegram API error");
+      }
+    } catch (err) {
+      logger.error({ err: String(err) }, "Failed to send Telegram message");
+    }
   }
 
-  async sendOpportunity(marketName: string, profit: number, profitBps: number): Promise<void> {
-    const text = `<b>📊 Arbitrage Opportunity Detected</b>\n\n<b>Market:</b> ${marketName}\n<b>Profit:</b> ${profit.toFixed(4)} (${profitBps.toFixed(0)}bps)`;
-    await this.send(text);
+  async notifyTrade(tradeId: string, market: string, profit: number, legs: number): Promise<void> {
+    const emoji = profit > 0 ? "✅" : "⚠️";
+    const msg = [
+      `${emoji} <b>Trade ${tradeId.slice(0, 8)}</b>`,
+      `Market: ${market}`,
+      `Legs: ${legs}`,
+      `Profit: $${profit.toFixed(4)}`,
+    ].join("\n");
+    await this.sendMessage(msg);
   }
 
-  async sendTrade(result: { success: boolean; loss?: number; ordersPlaced: string[] }): Promise<void> {
-    const status = result.success ? "✅ SUCCESS" : "❌ FAILED";
-    const details = result.loss ? `\n<b>Loss:</b> $${result.loss.toFixed(2)}` : "";
-    const text = `<b>🔄 Trade Execution</b>\n${status}${details}`;
-    await this.send(text);
+  async notifyError(context: string, error: string): Promise<void> {
+    const msg = `🚨 <b>Error</b>\nContext: ${context}\n<code>${error.slice(0, 500)}</code>`;
+    await this.sendMessage(msg);
   }
 
-  async sendKillSwitch(): Promise<void> {
-    await this.send("<b>🛑 KILL SWITCH ACTIVATED - Trading stopped immediately</b>");
+  async notifyRiskEvent(event: string, details: string): Promise<void> {
+    const msg = `🛑 <b>Risk Event</b>\n${event}\n${details}`;
+    await this.sendMessage(msg);
   }
 
-  async sendError(message: string): Promise<void> {
-    await this.send(`<b>⚠️ Error:</b> ${message}`);
+  async notifyDailySummary(stats: {
+    trades: number;
+    pnl: number;
+    wins: number;
+    losses: number;
+  }): Promise<void> {
+    const msg = [
+      "📊 <b>Daily Summary</b>",
+      `Trades: ${stats.trades}`,
+      `Wins/Losses: ${stats.wins}/${stats.losses}`,
+      `Net P&L: $${stats.pnl.toFixed(4)}`,
+    ].join("\n");
+    await this.sendMessage(msg);
   }
 }

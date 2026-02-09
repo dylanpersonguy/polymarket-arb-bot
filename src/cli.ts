@@ -1,79 +1,49 @@
-import pino from "pino";
-import { ClobClient } from "./clob/client.js";
-import { loadEnv } from "./config/load.js";
+#!/usr/bin/env node
 
-const logger = pino({ name: "CLI" });
+import { main } from "./index.js";
 
-async function main(): Promise<void> {
-  const args = process.argv.slice(2);
-  const command = args[0];
+const cmd = process.argv[2];
 
-  const env = loadEnv();
-  const client = new ClobClient(env);
-  await client.initialize();
-
-  switch (command) {
-    case "keys": {
-      logger.info("Validating API credentials...");
-
-      if (!env.POLYMARKET_PRIVATE_KEY) {
-        logger.error("POLYMARKET_PRIVATE_KEY not set");
-        process.exit(1);
-      }
-
-      logger.info("✓ Private key is set");
-
-      if (env.POLYMARKET_API_KEY) {
-        logger.info("✓ API key is set");
-      }
-
-      logger.info("✓ All required credentials are present");
+async function run(): Promise<void> {
+  switch (cmd) {
+    case "run":
+    case undefined:
+      await main();
       break;
-    }
 
-    case "book": {
-      const tokenIndex = args.indexOf("--token");
-      if (tokenIndex === -1 || !args[tokenIndex + 1]) {
-        logger.error("Usage: pnpm bot:book --token <tokenId>");
-        process.exit(1);
-      }
-
-      const tokenId = args[tokenIndex + 1];
-      logger.info({ tokenId }, "Fetching order book");
-
-      try {
-        const book = await client.getOrderBook(tokenId);
-        logger.info(
-          {
-            tokenId: book.tokenId,
-            bestBid: book.bestBidPrice,
-            bidSize: book.bestBidSize,
-            bestAsk: book.bestAskPrice,
-            askSize: book.bestAskSize,
-            timestamp: new Date(book.lastUpdatedMs).toISOString(),
-          },
-          "Order book"
-        );
-      } catch (error) {
-        logger.error({ error }, "Failed to fetch order book");
-        process.exit(1);
-      }
+    case "version":
+      console.log("polyarb v1.0.0");
       break;
-    }
 
-    default: {
-      logger.info("Available commands:");
-      logger.info("  pnpm bot:keys     - Validate API credentials");
-      logger.info("  pnpm bot:book     - View order book for a token");
-      logger.info("  pnpm bot:run      - Start the arbitrage bot");
-      process.exit(0);
-    }
+    case "help":
+    default:
+      console.log(`
+PolyArb — Polymarket Arbitrage Bot
+
+Usage:
+  npx tsx src/cli.ts run       Start the bot (default)
+  npx tsx src/cli.ts version   Print version
+  npx tsx src/cli.ts help      Show this help
+
+Environment Variables:
+  CLOB_API_KEY       Polymarket CLOB API key
+  CLOB_SECRET        CLOB secret
+  CLOB_PASSPHRASE    CLOB passphrase
+  CLOB_HOST          CLOB host (defaults to mainnet)
+  TELEGRAM_BOT_TOKEN Telegram bot token for notifications
+  TELEGRAM_CHAT_ID   Telegram chat ID for notifications
+
+Config Files:
+  config.json        Bot configuration (fees, risk limits, etc.)
+  markets.json       Market definitions (token IDs, types)
+
+See README.md for full documentation.
+`);
+      break;
   }
-
-  process.exit(0);
 }
 
-main().catch((error) => {
-  logger.error({ error }, "CLI error");
+run().catch((err) => {
+  console.error("Fatal error:", err);
   process.exit(1);
 });

@@ -1,56 +1,49 @@
 import pino from "pino";
 import { OrderBook } from "./types.js";
+import { isStale } from "../utils/time.js";
 
 const logger = pino({ name: "OrderBooks" });
 
+/**
+ * In-memory top-of-book cache with staleness checking.
+ * maxAgeMs is derived from config (2 * pollingIntervalMs + 200).
+ */
 export class OrderBookManager {
   private books = new Map<string, OrderBook>();
-  private readonly maxAgeMs: number;
 
-  constructor(maxAgeMs: number = 2000) {
-    this.maxAgeMs = maxAgeMs;
-  }
+  constructor(private readonly maxAgeMs: number) {}
 
   set(tokenId: string, book: OrderBook): void {
     this.books.set(tokenId, { ...book, lastUpdatedMs: Date.now() });
   }
 
+  /** Returns book only if fresh; null otherwise. */
   get(tokenId: string): OrderBook | null {
     const book = this.books.get(tokenId);
     if (!book) return null;
-
-    // Check if stale
-    if (Date.now() - book.lastUpdatedMs > this.maxAgeMs) {
-      logger.warn({ tokenId, ageMs: Date.now() - book.lastUpdatedMs }, "Stale order book");
+    if (isStale(book.lastUpdatedMs, this.maxAgeMs)) {
+      logger.debug({ tokenId, ageMs: Date.now() - book.lastUpdatedMs }, "Stale book ignored");
       return null;
     }
-
     return book;
   }
 
+  /** All fresh books. */
   getAll(): Map<string, OrderBook> {
     const result = new Map<string, OrderBook>();
-
-    for (const [tokenId, book] of this.books) {
-      if (Date.now() - book.lastUpdatedMs <= this.maxAgeMs) {
-        result.set(tokenId, book);
+    for (const [id, book] of this.books) {
+      if (!isStale(book.lastUpdatedMs, this.maxAgeMs)) {
+        result.set(id, book);
       }
     }
-
     return result;
   }
 
   has(tokenId: string): boolean {
-    const book = this.books.get(tokenId);
-    if (!book) return false;
-    return Date.now() - book.lastUpdatedMs <= this.maxAgeMs;
+    return this.get(tokenId) !== null;
   }
 
   clear(): void {
     this.books.clear();
-  }
-
-  size(): number {
-    return this.books.size;
   }
 }

@@ -1,52 +1,54 @@
+/**
+ * Token-bucket rate limiter.
+ *
+ * capacity   – max tokens available at any time
+ * refillRate – tokens added per second
+ */
 export class RateLimiter {
   private tokens: number;
   private lastRefillMs: number;
 
   constructor(
-    private capacity: number,
-    private refillRatePerSecond: number
+    private readonly capacity: number,
+    private readonly refillRatePerSecond: number
   ) {
     this.tokens = capacity;
     this.lastRefillMs = Date.now();
   }
 
-  async acquire(tokensNeeded: number = 1): Promise<void> {
+  /** Block until `n` tokens are available. */
+  async acquire(n: number = 1): Promise<void> {
+    // eslint-disable-next-line no-constant-condition
     while (true) {
       this.refill();
-
-      if (this.tokens >= tokensNeeded) {
-        this.tokens -= tokensNeeded;
+      if (this.tokens >= n) {
+        this.tokens -= n;
         return;
       }
-
-      const timeToWaitMs = ((tokensNeeded - this.tokens) / this.refillRatePerSecond) * 1000;
-      await new Promise((resolve) => setTimeout(resolve, timeToWaitMs + 10));
+      const waitMs = ((n - this.tokens) / this.refillRatePerSecond) * 1000 + 5;
+      await new Promise((r) => setTimeout(r, waitMs));
     }
   }
 
-  tryAcquire(tokensNeeded: number = 1): boolean {
+  tryAcquire(n: number = 1): boolean {
     this.refill();
-
-    if (this.tokens >= tokensNeeded) {
-      this.tokens -= tokensNeeded;
+    if (this.tokens >= n) {
+      this.tokens -= n;
       return true;
     }
-
     return false;
   }
 
   private refill(): void {
-    const nowMs = Date.now();
-    const elapsedSeconds = (nowMs - this.lastRefillMs) / 1000;
-    const tokensToAdd = elapsedSeconds * this.refillRatePerSecond;
-
-    if (tokensToAdd > 0) {
-      this.tokens = Math.min(this.capacity, this.tokens + tokensToAdd);
-      this.lastRefillMs = nowMs;
+    const now = Date.now();
+    const elapsed = (now - this.lastRefillMs) / 1000;
+    if (elapsed > 0) {
+      this.tokens = Math.min(this.capacity, this.tokens + elapsed * this.refillRatePerSecond);
+      this.lastRefillMs = now;
     }
   }
 
-  getAvailableTokens(): number {
+  available(): number {
     this.refill();
     return this.tokens;
   }
@@ -57,46 +59,42 @@ export class RateLimiter {
   }
 }
 
+/**
+ * Self-tuning rate limiter: backs off on 429 and slowly ramps up on success.
+ */
 export class AdaptiveRateLimiter {
+  private currentRate: number;
   private limiter: RateLimiter;
-  private errorCount = 0;
-  private successCount = 0;
 
-  constructor(initialRatePerSecond: number, private maxRate: number = 100) {
-    this.limiter = new RateLimiter(100, initialRatePerSecond);
+  constructor(
+    initialRatePerSecond: number,
+    private readonly maxRate: number = 20,
+    private readonly minRate: number = 1
+  ) {
+    this.currentRate = initialRatePerSecond;
+    this.limiter = new RateLimiter(30, initialRatePerSecond);
   }
 
-  async acquire(tokensNeeded: number = 1): Promise<void> {
-    return this.limiter.acquire(tokensNeeded);
+  async acquire(n: number = 1): Promise<void> {
+    return this.limiter.acquire(n);
   }
 
   recordSuccess(): void {
-    this.successCount++;
-    if (this.successCount > 10 && this.errorCount === 0) {
-      // Gradually increase rate
-      const currentRate = this.limiter.getAvailableTokens() / 100;
-      if (currentRate < this.maxRate) {
-        this.limiter = new RateLimiter(100, Math.min(currentRate * 1.1, this.maxRate));
-        this.successCount = 0;
-      }
-    }
+    // Ramp up 5 % per success, capped
+    this.currentRate = Math.min(this.currentRate * 1.05, this.maxRate);
+    this.limiter = new RateLimiter(30, this.currentRate);
   }
 
   recordError(statusCode?: number): void {
-    this.errorCount++;
-
     if (statusCode === 429) {
-      // Too many requests: reduce rate significantly
-      const currentRate = this.limiter.getAvailableTokens() / 100;
-      this.limiter = new RateLimiter(100, Math.max(currentRate * 0.5, 1));
+      this.currentRate = Math.max(this.currentRate * 0.5, this.minRate);
+    } else {
+      this.currentRate = Math.max(this.currentRate * 0.8, this.minRate);
     }
-
-    this.successCount = 0;
+    this.limiter = new RateLimiter(30, this.currentRate);
   }
 
-  reset(): void {
-    this.limiter.reset();
-    this.errorCount = 0;
-    this.successCount = 0;
+  getRate(): number {
+    return this.currentRate;
   }
 }

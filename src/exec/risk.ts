@@ -1,78 +1,105 @@
+import * as fs from "fs";
 import pino from "pino";
 
 const logger = pino({ name: "RiskManager" });
+
+export interface RiskConfig {
+  maxExposureUsd: number;
+  perMarketMaxUsd: number;
+  dailyStopLossUsd: number;
+  maxOpenOrders: number;
+  cooldownMs: number;
+  safeModeErrorThreshold: number;
+}
 
 export interface RiskState {
   globalExposureUsd: number;
   perMarketExposureUsd: Map<string, number>;
   openOrderCount: number;
   dailyLossUsd: number;
-  lastTradeTimeMs: number;
   cooldownEndMs: number;
+  consecutiveErrors: number;
+  safeModeActive: boolean;
+  lastDayUtc: number;
 }
 
 export class RiskManager {
-  private state: RiskState = {
-    globalExposureUsd: 0,
-    perMarketExposureUsd: new Map(),
-    openOrderCount: 0,
-    dailyLossUsd: 0,
-    lastTradeTimeMs: 0,
-    cooldownEndMs: 0,
-  };
+  private state: RiskState;
 
-  constructor(private config: { maxExposureUsd: number; perMarketMaxUsd: number; dailyStopLossUsd: number; cooldownMs: number }) {}
+  constructor(private cfg: RiskConfig) {
+    this.state = {
+      globalExposureUsd: 0,
+      perMarketExposureUsd: new Map(),
+      openOrderCount: 0,
+      dailyLossUsd: 0,
+      cooldownEndMs: 0,
+      consecutiveErrors: 0,
+      safeModeActive: false,
+      lastDayUtc: this.todayUtc(),
+    };
+  }
 
-  canTrade(marketName: string, estimatedExposure: number): { allowed: boolean; reason?: string } {
-    const now = Date.now();
+  /* ---------- pre-trade checks ---------- */
 
-    // Check kill switch
+  canTrade(
+    marketName: string,
+    estimatedExposureUsd: number
+  ): { allowed: boolean; reason?: string } {
+    // Kill switch
     if (this.isKillSwitchActive()) {
       return { allowed: false, reason: "Kill switch is active" };
     }
 
-    // Check cooldown
-    if (now < this.state.cooldownEndMs) {
-      const waitMs = this.state.cooldownEndMs - now;
-      return { allowed: false, reason: `In cooldown for ${waitMs}ms` };
+    // Safe mode
+    if (this.state.safeModeActive) {
+      return { allowed: false, reason: "Safe mode — too many consecutive errors" };
     }
 
-    // Check global exposure
-    if (this.state.globalExposureUsd + estimatedExposure > this.config.maxExposureUsd) {
+    // Cooldown
+    const now = Date.now();
+    if (now < this.state.cooldownEndMs) {
+      return { allowed: false, reason: `In cooldown for ${this.state.cooldownEndMs - now}ms` };
+    }
+
+    // Daily stop-loss
+    this.maybeDayRoll();
+    if (this.state.dailyLossUsd >= this.cfg.dailyStopLossUsd) {
+      return { allowed: false, reason: "Daily stop-loss reached" };
+    }
+
+    // Global exposure
+    if (this.state.globalExposureUsd + estimatedExposureUsd > this.cfg.maxExposureUsd) {
       return { allowed: false, reason: "Would exceed global exposure limit" };
     }
 
-    // Check per-market exposure
-    const currentMarketExp = this.state.perMarketExposureUsd.get(marketName) || 0;
-    if (currentMarketExp + estimatedExposure > this.config.perMarketMaxUsd) {
+    // Per-market exposure
+    const mktExp = this.state.perMarketExposureUsd.get(marketName) ?? 0;
+    if (mktExp + estimatedExposureUsd > this.cfg.perMarketMaxUsd) {
       return { allowed: false, reason: "Would exceed per-market exposure limit" };
     }
 
-    // Check daily stop loss
-    if (this.state.dailyLossUsd >= this.config.dailyStopLossUsd) {
-      return { allowed: false, reason: "Daily stop loss reached" };
+    // Max open orders
+    if (this.state.openOrderCount >= this.cfg.maxOpenOrders) {
+      return { allowed: false, reason: "Max open orders reached" };
     }
 
     return { allowed: true };
   }
 
-  updateExposure(
-    marketName: string,
-    globalDelta: number,
-    marketDelta: number
-  ): void {
+  /* ---------- state updates ---------- */
+
+  updateExposure(marketName: string, globalDelta: number, marketDelta: number): void {
     this.state.globalExposureUsd = Math.max(0, this.state.globalExposureUsd + globalDelta);
-    const current = this.state.perMarketExposureUsd.get(marketName) || 0;
-    this.state.perMarketExposureUsd.set(marketName, Math.max(0, current + marketDelta));
+    const cur = this.state.perMarketExposureUsd.get(marketName) ?? 0;
+    this.state.perMarketExposureUsd.set(marketName, Math.max(0, cur + marketDelta));
   }
 
-  recordTrade(): void {
-    this.state.lastTradeTimeMs = Date.now();
+  recordOrderPlaced(): void {
     this.state.openOrderCount++;
   }
 
-  recordFill(size: number = 1): void {
-    this.state.openOrderCount = Math.max(0, this.state.openOrderCount - size);
+  recordOrderClosed(n: number = 1): void {
+    this.state.openOrderCount = Math.max(0, this.state.openOrderCount - n);
   }
 
   recordLoss(lossUsd: number): void {
@@ -81,21 +108,65 @@ export class RiskManager {
   }
 
   activateCooldown(): void {
-    this.state.cooldownEndMs = Date.now() + this.config.cooldownMs;
-    logger.info(`Cooldown activated until ${new Date(this.state.cooldownEndMs).toISOString()}`);
+    this.state.cooldownEndMs = Date.now() + this.cfg.cooldownMs;
+    logger.info({ untilMs: this.state.cooldownEndMs }, "Cooldown activated");
   }
 
+  recordError(): void {
+    this.state.consecutiveErrors++;
+    if (this.state.consecutiveErrors >= this.cfg.safeModeErrorThreshold) {
+      this.state.safeModeActive = true;
+      logger.error("SAFE MODE activated — switching to DRY_RUN");
+    }
+  }
+
+  recordSuccess(): void {
+    this.state.consecutiveErrors = 0;
+  }
+
+  /* ---------- kill switch ---------- */
+
   isKillSwitchActive(): boolean {
-    // Check for KILL_SWITCH env var
-    return process.env.KILL_SWITCH === "1" || require("fs").existsSync("./KILL_SWITCH");
+    if (process.env.KILL_SWITCH === "1") return true;
+    try {
+      return fs.existsSync("./KILL_SWITCH");
+    } catch {
+      return false;
+    }
+  }
+
+  /* ---------- day roll ---------- */
+
+  private todayUtc(): number {
+    return Math.floor(Date.now() / 86_400_000);
+  }
+
+  private maybeDayRoll(): void {
+    const today = this.todayUtc();
+    if (today !== this.state.lastDayUtc) {
+      logger.info("New UTC day — resetting daily counters");
+      this.state.dailyLossUsd = 0;
+      this.state.lastDayUtc = today;
+    }
   }
 
   resetDaily(): void {
     this.state.dailyLossUsd = 0;
+    this.state.lastDayUtc = this.todayUtc();
   }
 
   getState(): RiskState {
     return { ...this.state };
+  }
+
+  isSafeMode(): boolean {
+    return this.state.safeModeActive;
+  }
+
+  /** Manual reset of safe mode (requires operator intervention). */
+  clearSafeMode(): void {
+    this.state.safeModeActive = false;
+    this.state.consecutiveErrors = 0;
   }
 
   reset(): void {
@@ -104,8 +175,10 @@ export class RiskManager {
       perMarketExposureUsd: new Map(),
       openOrderCount: 0,
       dailyLossUsd: 0,
-      lastTradeTimeMs: 0,
       cooldownEndMs: 0,
+      consecutiveErrors: 0,
+      safeModeActive: false,
+      lastDayUtc: this.todayUtc(),
     };
   }
 }
