@@ -1,0 +1,21 @@
+{
+  "marketsFile": "./markets.json",
+  "pollingIntervalMs": 400,
+  "minProfit": 0.002,
+  "feeBps": 5,
+  "slippageBps": 10,
+  "maxExposureUsd": 500,
+  "perMarketMaxUsd": 150,
+  "dailyStopLossUsd": 100,
+  "maxOpenOrders": 10,
+  "orderTimeoutMs": 1500,
+  "cooldownMs": 2500,
+  "minTopSizeUsd": 20,
+  "priceImprovementTicks": 0,
+  "enableLiveTrading": false,
+  "enableTelegram": true,
+  "paper": {
+    "fillProbability": 0.85,
+    "extraSlippageBps": 5
+  }
+}
