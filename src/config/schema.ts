@@ -108,6 +108,7 @@ export const EnvSchema = z.object({
   POLYMARKET_API_PASSPHRASE: z.string().optional(),
   TELEGRAM_BOT_TOKEN: z.string().optional(),
   TELEGRAM_CHAT_ID: z.string().optional(),
+  DASHBOARD_PORT: z.string().optional(),
   MODE: z.enum(["dry", "paper", "live"]).default("dry"),
   LOG_LEVEL: z.enum(["debug", "info", "warn", "error"]).default("info"),
   KILL_SWITCH: z

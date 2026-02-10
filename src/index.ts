@@ -21,6 +21,7 @@ import { Metrics } from "./monitoring/metrics.js";
 import { TradeRepository, ConfigSnapshotRepository } from "./storage/repositories.js";
 import { closeDb } from "./storage/db.js";
 import { sleep } from "./utils/sleep.js";
+import { startDashboard, type ScanSnapshot } from "./monitoring/dashboard.js";
 
 const logger = pino({ name: "Main" });
 
@@ -170,6 +171,27 @@ export async function main(): Promise<void> {
     }
   }
 
+  /* ---- Dashboard ---- */
+  const scanState: ScanSnapshot = {
+    cycle: 0,
+    freshBooks: 0,
+    totalTokenIds,
+    oppsThisCycle: 0,
+    qualifiedThisCycle: 0,
+    lastOpp: null,
+    marketGaps: [],
+  };
+
+  const DASHBOARD_PORT = parseInt(env.DASHBOARD_PORT ?? "3456", 10);
+  const dashboardServer = startDashboard(DASHBOARD_PORT, {
+    metrics,
+    health,
+    bookMgr,
+    markets: () => markets,
+    mode,
+    scanState: () => scanState,
+  });
+
   /* ---- Graceful shutdown ---- */
   let running = true;
   const shutdown = async () => {
@@ -179,6 +201,7 @@ export async function main(): Promise<void> {
     posMonitor.stop();
     if (wsManager) wsManager.stop();
     if (scanner) scanner.stop();
+    dashboardServer.close();
 
     // Cancel all open orders locally
     orderMgr.cancelAll();
@@ -337,10 +360,45 @@ export async function main(): Promise<void> {
         );
       }
 
+      // Update dashboard scan state
+      const marketGaps: ScanSnapshot["marketGaps"] = [];
+      for (const market of markets) {
+        if (isBinary(market)) {
+          const yb = bookMgr.get(market.yesTokenId);
+          const nb = bookMgr.get(market.noTokenId);
+          if (yb && nb) {
+            marketGaps.push({
+              market: market.name,
+              askYes: yb.bestAskPrice,
+              askNo: nb.bestAskPrice,
+              gap: +((yb.bestAskPrice + nb.bestAskPrice - 1) * 100).toFixed(3),
+              bidYes: yb.bestBidPrice,
+              bidNo: nb.bestBidPrice,
+              spreadYes: +((yb.bestAskPrice - yb.bestBidPrice) * 100).toFixed(2),
+              spreadNo: +((nb.bestAskPrice - nb.bestBidPrice) * 100).toFixed(2),
+            });
+          }
+        }
+      }
+      scanState.cycle = loopCount;
+      scanState.freshBooks = freshBooks.size;
+      scanState.oppsThisCycle = opps.length;
+      scanState.qualifiedThisCycle = qualified.length;
+      scanState.marketGaps = marketGaps;
+
       const best = bestOpportunity(qualified);
 
       if (best) {
         metrics.inc("opportunities_found");
+        scanState.lastOpp = {
+          marketName: best.marketName,
+          expectedProfit: best.expectedProfit,
+          expectedProfitBps: best.expectedProfitBps,
+          totalCost: best.totalCost,
+          detectedAt: best.detectedAt,
+          type: best.type,
+          summary: oppSummary(best),
+        };
         logger.info({ opp: oppSummary(best) }, "Opportunity found");
 
         // 4. Execute
