@@ -1,5 +1,6 @@
 import * as fs from "fs";
 import * as path from "path";
+import pino from "pino";
 import {
   Config,
   ConfigSchema,
@@ -8,6 +9,8 @@ import {
   MarketSchema,
   Env,
 } from "./schema.js";
+
+const logger = pino({ name: "Config" });
 
 export function loadEnv(): Env {
   const envPath = path.join(process.cwd(), ".env");
@@ -63,4 +66,65 @@ export function loadMarkets(marketsPath?: string): Market[] {
       throw new Error(`Invalid market at index ${i}: ${e}`);
     }
   });
+}
+
+/**
+ * Hot-reload: watch config.json for changes and call `onReload` with the new config.
+ * Uses debouncing to avoid rapid re-reads. Returns a cleanup function.
+ *
+ * Only "safe" runtime fields are updated — structural fields like `wsEnabled`
+ * and `marketDiscoveryEnabled` require a restart.
+ */
+export type HotReloadableFields = Pick<Config,
+  | "pollingIntervalMs"
+  | "minProfit"
+  | "takerFeeBps"
+  | "makerFeeBps"
+  | "slippageBps"
+  | "maxExposureUsd"
+  | "perMarketMaxUsd"
+  | "dailyStopLossUsd"
+  | "maxOpenOrders"
+  | "orderTimeoutMs"
+  | "cooldownMs"
+  | "perMarketCooldownMs"
+  | "minTopSizeUsd"
+  | "maxSpreadBps"
+  | "kellyFraction"
+  | "bankrollUsd"
+  | "oppCooldownMs"
+  | "positionMaxAgeMs"
+  | "trailingStopBps"
+  | "enableLiveTrading"
+>;
+
+export function watchConfig(
+  configPath: string | undefined,
+  onReload: (newCfg: Config) => void
+): () => void {
+  const resolved = configPath ?? path.join(process.cwd(), "config.json");
+  let debounceTimer: NodeJS.Timeout | null = null;
+  let lastMtime = 0;
+
+  const watcher = fs.watch(resolved, () => {
+    if (debounceTimer) clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(() => {
+      try {
+        const stat = fs.statSync(resolved);
+        if (stat.mtimeMs === lastMtime) return; // no actual change
+        lastMtime = stat.mtimeMs;
+
+        const newCfg = loadConfig(resolved);
+        logger.info("Config hot-reloaded from disk");
+        onReload(newCfg);
+      } catch (err) {
+        logger.warn({ err: String(err) }, "Failed to hot-reload config — keeping current");
+      }
+    }, 500);
+  });
+
+  return () => {
+    if (debounceTimer) clearTimeout(debounceTimer);
+    watcher.close();
+  };
 }

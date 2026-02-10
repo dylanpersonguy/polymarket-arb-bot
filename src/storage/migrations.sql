@@ -36,3 +36,32 @@ CREATE TABLE IF NOT EXISTS config_snapshots (
   config     TEXT NOT NULL,  -- JSON blob
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+-- scanner results persistence
+CREATE TABLE IF NOT EXISTS scanner_results (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  market_name  TEXT NOT NULL,
+  market_type  TEXT NOT NULL CHECK (market_type IN ('binary','negRisk')),
+  score        REAL NOT NULL,
+  gap_pct      REAL,
+  liquidity    REAL,
+  outcomes     INTEGER NOT NULL DEFAULT 2,
+  token_ids    TEXT NOT NULL,   -- JSON array
+  condition_id TEXT,
+  created_at   TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_scanner_results_created ON scanner_results(created_at);
+CREATE INDEX IF NOT EXISTS idx_scanner_results_score ON scanner_results(score DESC);
+
+-- per-endpoint latency tracking
+CREATE TABLE IF NOT EXISTS latency_samples (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  endpoint   TEXT NOT NULL,
+  latency_ms INTEGER NOT NULL,
+  status     INTEGER NOT NULL DEFAULT 200,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_latency_endpoint ON latency_samples(endpoint);
+CREATE INDEX IF NOT EXISTS idx_latency_created ON latency_samples(created_at);

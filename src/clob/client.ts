@@ -1,4 +1,6 @@
 import pino from "pino";
+import http from "node:http";
+import https from "node:https";
 import { ethers } from "ethers";
 import {
   ClobClient as PolyClobClient,
@@ -40,11 +42,24 @@ export class ClobClient {
   private authBreaker: CircuitBreaker;   // authenticated endpoints (balance, orders)
   private sdk: PolyClobClient | null = null;
 
+  /** Keep-alive agents — reuse TCP connections for 5x less latency */
+  private readonly httpAgent = new http.Agent({ keepAlive: true, maxSockets: 20, keepAliveMsecs: 30_000 });
+  private readonly httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 20, keepAliveMsecs: 30_000 });
+
+  /** Rate-limit priority: "high" consumes 1 token, "low" consumes 2 (used for non-critical scans) */
+  private priority: "high" | "low" = "high";
+
   constructor(private env: Env) {
     this.limiter = new AdaptiveRateLimiter(10, 20);
     this.bookBreaker = new CircuitBreaker(5, 2, 30_000);
     this.authBreaker = new CircuitBreaker(5, 2, 30_000);
   }
+
+  /** Set rate-limit priority — "high" for arb path, "low" for background scanning */
+  setPriority(p: "high" | "low"): void { this.priority = p; }
+
+  /** Get the HTTPS keep-alive agent for external use */
+  getHttpsAgent(): https.Agent { return this.httpsAgent; }
 
   async initialize(): Promise<void> {
     if (!this.env.POLYMARKET_PRIVATE_KEY || this.env.POLYMARKET_PRIVATE_KEY === "0x") {
@@ -88,7 +103,8 @@ export class ClobClient {
   /* ---- Order book ---- */
 
   async getOrderBook(tokenId: string): Promise<OrderBook> {
-    await this.limiter.acquire();
+    const tokens = this.priority === "low" ? 2 : 1;
+    await this.limiter.acquire(tokens);
     return this.bookBreaker.execute(() =>
       retry(
         async () => {
@@ -116,6 +132,29 @@ export class ClobClient {
       } catch (err) {
         logger.error({ tokenId: id, err: String(err) }, "getOrderBook failed");
         this.limiter.recordError(500);
+      }
+    }
+    return results;
+  }
+
+  /** Fetch multiple order books in parallel batches for speed */
+  async getMultipleOrderBooksParallel(tokenIds: string[], batchSize = 10): Promise<Map<string, OrderBook>> {
+    const results = new Map<string, OrderBook>();
+    for (let i = 0; i < tokenIds.length; i += batchSize) {
+      const batch = tokenIds.slice(i, i + batchSize);
+      const settled = await Promise.allSettled(
+        batch.map(async (id) => {
+          const book = await this.getOrderBook(id);
+          this.limiter.recordSuccess();
+          return { id, book };
+        })
+      );
+      for (const r of settled) {
+        if (r.status === "fulfilled" && r.value.book) {
+          results.set(r.value.id, r.value.book);
+        } else if (r.status === "rejected") {
+          this.limiter.recordError(500);
+        }
       }
     }
     return results;
@@ -190,6 +229,62 @@ export class ClobClient {
           onRetry: (attempt, err) => {
             if (err.message.includes("429")) this.limiter.recordError(429);
             logger.warn({ tokenId, side, attempt }, "Retrying placeOrder");
+          },
+        }
+      )
+    );
+  }
+
+  /**
+   * Place a GTC limit order (maker) — 0% fee on Polymarket.
+   * Posts at a price below the best ask to sit on the book.
+   * Returns null if the order can't be placed.
+   */
+  async placeLimitOrder(
+    tokenId: string,
+    side: "buy" | "sell",
+    price: number,
+    size: number
+  ): Promise<Order> {
+    await this.limiter.acquire(2);
+    return this.authBreaker.execute(() =>
+      retry(
+        async () => {
+          logger.info({ tokenId, side, price, size, type: "maker" }, "Placing limit (maker) order");
+
+          const sdkSide = side === "buy" ? Side.BUY : Side.SELL;
+          const signedOrder = await this.getSdk().createOrder({
+            tokenID: tokenId,
+            price,
+            size,
+            side: sdkSide,
+          });
+
+          // Post as GTC — sits on book = maker
+          const resp = await this.getSdk().postOrder(signedOrder, OrderType.GTC);
+          const orderId: string = resp?.orderID ?? resp?.id ?? `ord_${Date.now()}`;
+
+          const order: Order = {
+            id: orderId,
+            tokenId,
+            side,
+            price,
+            size,
+            filledSize: 0,
+            status: "open",
+            createdAt: Date.now(),
+            updatedAt: Date.now(),
+          };
+
+          logger.info({ orderId, type: "maker" }, "Limit order placed successfully");
+          return order;
+        },
+        {
+          maxAttempts: 2,
+          initialDelayMs: 200,
+          onRetry: (attempt, err) => {
+            if (err.message.includes("429")) this.limiter.recordError(429);
+            logger.warn({ tokenId, side, attempt, type: "maker" }, "Retrying placeLimitOrder");
           },
         }
       )
@@ -279,5 +374,19 @@ export class ClobClient {
 
   getCircuitBreakerState(): "closed" | "open" | "half-open" {
     return this.bookBreaker.getState();
+  }
+
+  getAuthCircuitBreakerState(): "closed" | "open" | "half-open" {
+    return this.authBreaker.getState();
+  }
+
+  getRateLimitRate(): number {
+    return this.limiter.getRate();
+  }
+
+  /** Clean up keep-alive sockets on shutdown */
+  destroy(): void {
+    this.httpAgent.destroy();
+    this.httpsAgent.destroy();
   }
 }

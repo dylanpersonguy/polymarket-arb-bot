@@ -1,5 +1,5 @@
 import pino from "pino";
-import { loadConfig, loadMarkets, loadEnv } from "./config/load.js";
+import { loadConfig, loadMarkets, loadEnv, watchConfig } from "./config/load.js";
 import type { Env, Config, Market, MarketBinary, MarketMulti } from "./config/schema.js";
 import { ClobClient } from "./clob/client.js";
 import { OrderBookManager } from "./clob/books.js";
@@ -11,6 +11,8 @@ import { detectMultiOutcomeArb } from "./arb/multiOutcome.js";
 import { bestOpportunity, filterByMinProfitBps, OppCooldownTracker, filterSuppressed } from "./arb/filters.js";
 import { Opportunity, oppSummary, isComplement } from "./arb/opportunity.js";
 import { MarketScanner } from "./arb/marketScanner.js";
+import { GapTracker } from "./arb/gapTracker.js";
+import { findCorrelatedMarkets, detectCrossEventArbs } from "./arb/crossEvent.js";
 import { RiskManager } from "./exec/risk.js";
 import { Executor, ExecutionResult } from "./exec/executor.js";
 import { PositionMonitor, ExitResult } from "./exec/positionMonitor.js";
@@ -46,7 +48,7 @@ function isMulti(m: Market): m is MarketMulti {
 export async function main(): Promise<void> {
   /* ---- Load env & config ---- */
   const env: Env = loadEnv();
-  const cfg: Config = loadConfig();
+  let cfg: Config = loadConfig();
   let markets: Market[] = loadMarkets();
 
   const mode = env.MODE; // "dry" | "paper" | "live"
@@ -95,6 +97,8 @@ export async function main(): Promise<void> {
     feeBps: cfg.takerFeeBps,                             // #13
     slippageBps: cfg.slippageBps,                        // for revalidation
     minProfit: cfg.minProfit,                            // for revalidation
+    preferMakerOrders: cfg.makerFeeBps < cfg.takerFeeBps, // prefer maker if cheaper
+    makerFeeBps: cfg.makerFeeBps,                        // maker fee rate
   });
 
   // #11 — Opportunity cooldown tracker
@@ -208,6 +212,9 @@ export async function main(): Promise<void> {
   const execQuality = new ExecQualityTracker();
   const dataQuality = new DataQualityTracker();
 
+  // Gap tracking for adaptive scoring
+  const gapTracker = new GapTracker();
+
   // Track WS connection state
   if (wsManager) {
     dataQuality.setWsConnected(true);
@@ -255,6 +262,18 @@ export async function main(): Promise<void> {
     dataQuality,
   });
 
+  /* ---- Hot-reload config ---- */
+  const stopConfigWatch = watchConfig(undefined, (newCfg) => {
+    // Update safe runtime fields without restart
+    cfg = newCfg;
+    logger.info({
+      pollingIntervalMs: cfg.pollingIntervalMs,
+      minProfit: cfg.minProfit,
+      maxExposureUsd: cfg.maxExposureUsd,
+      enableLiveTrading: cfg.enableLiveTrading,
+    }, "Config hot-reloaded — runtime fields updated");
+  });
+
   /* ---- Graceful shutdown ---- */
   let running = true;
   const shutdown = async () => {
@@ -264,6 +283,8 @@ export async function main(): Promise<void> {
     posMonitor.stop();
     if (wsManager) wsManager.stop();
     if (scanner) scanner.stop();
+    stopConfigWatch();
+    clobClient.destroy();
     dashboardServer.close();
 
     // Cancel all open orders locally
@@ -298,32 +319,40 @@ export async function main(): Promise<void> {
         }
       }
 
-      // 1. Refresh order books (skip if WS is feeding them)
+      // 1. Refresh order books — parallel batched fetch (skip if WS is feeding them)
       if (!cfg.wsEnabled) {
         const t0 = Date.now();
+        const allTokenIds = collectAllTokenIds(markets);
+        const BATCH_SIZE = 10; // concurrent requests per batch
         let fetched = 0;
         let failed = 0;
-        for (const market of markets) {
-          const tokenIds: string[] = isBinary(market)
-            ? [market.yesTokenId, market.noTokenId]
-            : market.outcomes.map((o) => o.tokenId);
 
-          for (const tid of tokenIds) {
-            try {
+        for (let i = 0; i < allTokenIds.length; i += BATCH_SIZE) {
+          const batch = allTokenIds.slice(i, i + BATCH_SIZE);
+          const results = await Promise.allSettled(
+            batch.map(async (tid) => {
               const t1 = Date.now();
               const book = await clobClient.getOrderBook(tid);
               dataQuality.recordLatency(Date.now() - t1);
-              if (book) { bookMgr.set(tid, book); fetched++; }
-            } catch (err) {
+              return { tid, book };
+            })
+          );
+          for (const r of results) {
+            if (r.status === "fulfilled" && r.value.book) {
+              bookMgr.set(r.value.tid, r.value.book);
+              fetched++;
+            } else {
               failed++;
               dataQuality.recordRetry();
-              logger.debug({ tokenId: tid, err: String(err) }, "Book fetch failed");
+              if (r.status === "rejected") {
+                logger.debug({ err: String(r.reason) }, "Book fetch failed");
+              }
             }
           }
         }
         const elapsed = Date.now() - t0;
         if (loopCount <= 3 || loopCount % 10 === 0) {
-          logger.info({ cycle: loopCount, fetched, failed, elapsedMs: elapsed }, "Book fetch pass");
+          logger.info({ cycle: loopCount, fetched, failed, elapsedMs: elapsed, batchSize: BATCH_SIZE }, "Book fetch pass (parallel)");
         }
       }
 
@@ -349,6 +378,8 @@ export async function main(): Promise<void> {
           if (yesBook && noBook) {
             // Raw gap: how far from arb (askYes + askNo - 1)
             const rawGap = yesBook.bestAskPrice + noBook.bestAskPrice - 1;
+            // Record gap for adaptive scoring
+            gapTracker.recordGap(market.name, rawGap * 100);
             if (rawGap < bestRawGap) {
               bestRawGap = rawGap;
               bestGapMarket = market.name;
@@ -404,6 +435,14 @@ export async function main(): Promise<void> {
         }
       }
 
+      // Cross-event arbitrage detection
+      const correlatedGroups = findCorrelatedMarkets(markets);
+      const crossEventPairs = detectCrossEventArbs(correlatedGroups, freshBooks, cfg.takerFeeBps);
+      if (crossEventPairs.length > 0 && (loopCount <= 3 || loopCount % 10 === 0)) {
+        logger.info({ count: crossEventPairs.length, best: crossEventPairs[0] }, "Cross-event arb candidates");
+      }
+      metrics.gauge("cross_event_pairs", crossEventPairs.length);
+
       metrics.inc("scan_cycles");
 
       // Feed funnel: record all detected opps
@@ -430,6 +469,11 @@ export async function main(): Promise<void> {
           },
           "Scan cycle complete",
         );
+      }
+
+      // Telegram gap alerts — notify when gap is within 0.5% of profitability
+      if (bestGapMarket && bestRawGap * 100 <= 0.5) {
+        telegram.notifyGapAlert(bestGapMarket, bestRawGap * 100, bestGapAskYes, bestGapAskNo).catch(() => {});
       }
 
       // Update dashboard scan state
@@ -589,7 +633,8 @@ export async function main(): Promise<void> {
           marketPerf.recordTrade(best.marketName, best.expectedProfit, true, false, 0, best.expectedProfitBps);
 
           // PnL attribution (approximate)
-          pnlTracker.record(best.expectedProfit, best.totalCost * (cfg.takerFeeBps / 10_000), 0, 0);
+          const pnlType = best.type === "binary_complement" ? "binary" : "multi";
+          pnlTracker.record(best.expectedProfit, best.totalCost * (cfg.takerFeeBps / 10_000), 0, 0, pnlType as "binary" | "multi");
 
           funnel.record("net_profitable");
 
@@ -609,7 +654,7 @@ export async function main(): Promise<void> {
             funnel.record("hedged");
             timeline.addEvent(best.tradeId, "hedge_triggered", `loss: $${execResult.lossUsd.toFixed(2)}`);
             marketPerf.recordTrade(best.marketName, -execResult.lossUsd, false, true, 0, best.expectedProfitBps);
-            pnlTracker.record(0, 0, 0, execResult.lossUsd);
+            pnlTracker.record(0, 0, 0, execResult.lossUsd, best.type === "binary_complement" ? "binary" : "multi");
           } else {
             marketPerf.recordTrade(best.marketName, 0, false, false, 0, best.expectedProfitBps);
           }
@@ -641,6 +686,7 @@ export async function main(): Promise<void> {
     // #11 — Prune stale cooldown entries periodically
     if (loopCount % METRICS_LOG_INTERVAL === 0) {
       oppTracker.prune();
+      gapTracker.prune();
     }
 
     // Periodic metrics log
@@ -649,6 +695,8 @@ export async function main(): Promise<void> {
       metrics.gauge("open_orders", orderMgr.openCount());
       metrics.gauge("exposure_usd", positionMgr.totalExposureUsd());
       metrics.gauge("tracked_positions", posMonitor.getTracked().length);
+      const gapSummary = gapTracker.getSummary();
+      metrics.gauge("gap_hot_markets", gapSummary.hotMarkets);
       if (paperBroker) {
         metrics.gauge("paper_pnl", paperBroker.realizedPnl);
       }

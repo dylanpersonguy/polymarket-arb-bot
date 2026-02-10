@@ -40,6 +40,8 @@ export interface ExecutorConfig {
   feeBps: number;                   // for pre-trade revalidation
   slippageBps: number;              // for pre-trade revalidation
   minProfit: number;                // for pre-trade revalidation
+  preferMakerOrders: boolean;       // prefer 0% fee maker orders
+  makerFeeBps: number;              // maker fee rate
 }
 
 /**
@@ -182,8 +184,8 @@ export class Executor {
     const orderPromises = legs.map(async (leg) => {
       const orderPrice = this.computeOrderPrice(leg.askPrice);
       this.risk.recordOrderPlaced();
-      logger.info({ tradeId, tokenId: leg.tokenId, orderPrice, size }, "Placing leg (concurrent)");
-      const order = await this.client.placeOrder(leg.tokenId, "buy", orderPrice, size);
+      logger.info({ tradeId, tokenId: leg.tokenId, orderPrice, size, preferMaker: this.cfg.preferMakerOrders }, "Placing leg (concurrent)");
+      const order = await this.placeOrderForLeg(leg.tokenId, leg.askPrice, leg.bidPrice, size);
       return { order, leg, orderPrice };
     });
 
@@ -271,10 +273,10 @@ export class Executor {
       const timeout = this.getTimeout();
 
       this.risk.recordOrderPlaced();
-      logger.info({ tradeId, leg: i, tokenId: leg.tokenId, orderPrice, size }, "Placing leg");
+      logger.info({ tradeId, leg: i, tokenId: leg.tokenId, orderPrice, size, preferMaker: this.cfg.preferMakerOrders }, "Placing leg");
 
       try {
-        const order = await this.client.placeOrder(leg.tokenId, "buy", orderPrice, size);
+        const order = await this.placeOrderForLeg(leg.tokenId, leg.askPrice, leg.bidPrice, size);
 
         // Wait for fill (#3 — partial fill aware)
         const startMs = Date.now();
@@ -282,12 +284,23 @@ export class Executor {
         const elapsed = Date.now() - startMs;
 
         if (!fillResult.filled) {
-          // Timeout — cancel
-          await this.client.cancelOrder(order.id);
+          // Timeout — try once more with improved price before hedging
+          const retryResult = await this.retryWithImprovedPrice(order.id, leg.tokenId, orderPrice, size);
+          if (retryResult.filled) {
+            const actualSize = retryResult.filledSize > 0 ? retryResult.filledSize : size;
+            if (retryResult.partial) partialCount++;
+            filledLegs.push({ tokenId: leg.tokenId, price: orderPrice + 0.01, size, filledSize: actualSize });
+            filledSizes.push(actualSize);
+            this.risk.recordOrderClosed();
+            this.risk.recordSuccess();
+            logger.info({ tradeId, leg: i }, "Leg filled on retry");
+            continue;
+          }
+
           this.risk.recordOrderClosed();
           filledSizes.push(0);
 
-          logger.warn({ tradeId, leg: i }, "Leg timed out — cancelled");
+          logger.warn({ tradeId, leg: i }, "Leg timed out after retry — hedging");
 
           const hedgeLoss = await this.hedgeAll(
             filledLegs.map(f => ({ tokenId: f.tokenId, price: f.price, size: f.filledSize })),
@@ -340,6 +353,38 @@ export class Executor {
     return roundPriceUp(improved);
   }
 
+  /**
+   * Compute maker order price — sits below best ask to avoid crossing the spread.
+   * Placed 1-2 ticks below best ask to ensure maker status (0% fee).
+   */
+  private computeMakerPrice(askPrice: number, bidPrice: number): number {
+    // Place at mid-price between best bid and best ask
+    const mid = (askPrice + bidPrice) / 2;
+    // Round to nearest tick, but ensure we're below the ask
+    const makerPrice = Math.min(roundPriceUp(mid), askPrice - 0.01);
+    return Math.max(0.01, makerPrice);
+  }
+
+  /**
+   * Decide whether to use a maker or taker order for this leg.
+   * Uses maker if configured and the spread is wide enough to justify waiting.
+   */
+  private async placeOrderForLeg(
+    tokenId: string,
+    askPrice: number,
+    bidPrice: number,
+    size: number
+  ): Promise<import("../clob/types.js").Order> {
+    if (this.cfg.preferMakerOrders && askPrice - bidPrice >= 0.02) {
+      // Wide enough spread — use maker order for 0% fee
+      const makerPrice = this.computeMakerPrice(askPrice, bidPrice);
+      return this.client.placeLimitOrder(tokenId, "buy", makerPrice, size);
+    }
+    // Tight spread or not configured — use taker
+    const orderPrice = this.computeOrderPrice(askPrice);
+    return this.client.placeOrder(tokenId, "buy", orderPrice, size);
+  }
+
   /** #15 — Get current timeout: adaptive if enabled, else static config. */
   private getTimeout(): number {
     return this.cfg.adaptiveTimeoutEnabled ? this.adaptiveTimeout.get() : this.cfg.orderTimeoutMs;
@@ -370,6 +415,35 @@ export class Executor {
       await sleep(Math.min(150, timeoutMs / 10));
     }
     return { filled: false, partial: false, filledSize: 0 };
+  }
+
+  /**
+   * Retry a partially filled or unfilled order with an improved price.
+   * Cancels the original, re-places at a slightly better price.
+   * Returns the fill result of the retry.
+   */
+  private async retryWithImprovedPrice(
+    orderId: string,
+    tokenId: string,
+    originalPrice: number,
+    remainingSize: number
+  ): Promise<{ filled: boolean; partial: boolean; filledSize: number }> {
+    try {
+      await this.client.cancelOrder(orderId);
+    } catch { /* already cancelled or filled */ }
+
+    // Improve price by 1 tick (0.01) to increase fill probability
+    const improvedPrice = roundPriceUp(Math.min(originalPrice + 0.01, 0.99));
+    logger.info({ tokenId, originalPrice, improvedPrice, remainingSize }, "Retrying with improved price");
+
+    try {
+      const retryOrder = await this.client.placeOrder(tokenId, "buy", improvedPrice, remainingSize);
+      const timeout = Math.min(this.getTimeout(), 3000); // shorter timeout for retries
+      return this.pollForFillDetailed(retryOrder.id, timeout);
+    } catch (err) {
+      logger.warn({ tokenId, err: String(err) }, "Retry placement failed");
+      return { filled: false, partial: false, filledSize: 0 };
+    }
   }
 
   /** Sell all filled legs at best bid to limit loss. */

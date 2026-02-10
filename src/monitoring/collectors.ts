@@ -278,14 +278,15 @@ interface PnlEvent {
   fees: number;
   slippage: number;
   hedgeLoss: number;
+  marketType: "binary" | "multi" | "cross_event";
 }
 
 export class PnlTracker {
   private events: PnlEvent[] = [];
   private readonly maxEvents = 50_000;
 
-  record(grossEdge: number, fees: number, slippage: number, hedgeLoss: number): void {
-    this.events.push({ timestamp: Date.now(), grossEdge, fees, slippage, hedgeLoss });
+  record(grossEdge: number, fees: number, slippage: number, hedgeLoss: number, marketType: "binary" | "multi" | "cross_event" = "binary"): void {
+    this.events.push({ timestamp: Date.now(), grossEdge, fees, slippage, hedgeLoss, marketType });
     if (this.events.length > this.maxEvents) {
       this.events.splice(0, this.events.length - this.maxEvents);
     }
@@ -312,6 +313,35 @@ export class PnlTracker {
       hedgeLosses: +hedgeLosses.toFixed(4),
       net: +(grossEdge - fees - slippage - hedgeLosses).toFixed(4),
     };
+  }
+
+  /** Get PnL broken down by market type */
+  snapshotByType(periodMs: number): Record<string, PnlDecomposition> {
+    const cutoff = Date.now() - periodMs;
+    const recent = this.events.filter((e) => e.timestamp >= cutoff);
+    const types: ("binary" | "multi" | "cross_event")[] = ["binary", "multi", "cross_event"];
+    const result: Record<string, PnlDecomposition> = {};
+
+    let period: "1h" | "24h" | "7d" = "1h";
+    if (periodMs > 3_600_000 * 24) period = "7d";
+    else if (periodMs > 3_600_000) period = "24h";
+
+    for (const t of types) {
+      const filtered = recent.filter(e => e.marketType === t);
+      const grossEdge = filtered.reduce((s, e) => s + e.grossEdge, 0);
+      const fees = filtered.reduce((s, e) => s + e.fees, 0);
+      const slippage = filtered.reduce((s, e) => s + e.slippage, 0);
+      const hedgeLosses = filtered.reduce((s, e) => s + e.hedgeLoss, 0);
+      result[t] = {
+        period,
+        grossEdge: +grossEdge.toFixed(4),
+        fees: +fees.toFixed(4),
+        slippage: +slippage.toFixed(4),
+        hedgeLosses: +hedgeLosses.toFixed(4),
+        net: +(grossEdge - fees - slippage - hedgeLosses).toFixed(4),
+      };
+    }
+    return result;
   }
 }
 
@@ -375,9 +405,19 @@ export class DataQualityTracker {
   private wsDropped = 0;
   private _wsConnected = false;
 
-  recordLatency(ms: number): void {
+  /** Per-endpoint latency tracking */
+  private endpointLatencies = new Map<string, number[]>();
+  private readonly maxEndpointSamples = 100;
+
+  recordLatency(ms: number, endpoint = "getOrderBook"): void {
     this.latencies.push(ms);
     if (this.latencies.length > this.maxLatencies) this.latencies.shift();
+
+    // Per-endpoint tracking
+    let arr = this.endpointLatencies.get(endpoint);
+    if (!arr) { arr = []; this.endpointLatencies.set(endpoint, arr); }
+    arr.push(ms);
+    if (arr.length > this.maxEndpointSamples) arr.shift();
   }
 
   recordRetry(): void { this.retries++; }
@@ -405,5 +445,19 @@ export class DataQualityTracker {
       wsReconnectCount: this.wsReconnects,
       wsDroppedUpdates: this.wsDropped,
     };
+  }
+
+  /** Get per-endpoint latency breakdown */
+  endpointSnapshot(): { endpoint: string; p50: number; p95: number; count: number }[] {
+    const results: { endpoint: string; p50: number; p95: number; count: number }[] = [];
+    for (const [endpoint, latencies] of this.endpointLatencies) {
+      results.push({
+        endpoint,
+        p50: +this.percentile(latencies, 50).toFixed(0),
+        p95: +this.percentile(latencies, 95).toFixed(0),
+        count: latencies.length,
+      });
+    }
+    return results.sort((a, b) => b.p95 - a.p95);
   }
 }

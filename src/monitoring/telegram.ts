@@ -81,4 +81,70 @@ export class TelegramNotifier {
     ].join("\n");
     await this.sendMessage(msg);
   }
+
+  /**
+   * Alert when a gap is approaching profitability.
+   * Only fires if the gap is within `thresholdBps` of being profitable.
+   */
+  private lastGapAlertAt = new Map<string, number>();
+  private readonly gapAlertCooldownMs = 60_000; // 1 minute between alerts per market
+
+  async notifyGapAlert(
+    market: string,
+    gapPct: number,
+    askYes: number,
+    askNo: number
+  ): Promise<void> {
+    const now = Date.now();
+    const lastAlert = this.lastGapAlertAt.get(market) ?? 0;
+    if (now - lastAlert < this.gapAlertCooldownMs) return;
+
+    this.lastGapAlertAt.set(market, now);
+
+    const emoji = gapPct <= 0 ? "🔥" : "👀";
+    const msg = [
+      `${emoji} <b>Gap Alert</b>`,
+      `Market: ${market}`,
+      `Gap: ${gapPct.toFixed(2)}%`,
+      `Ask YES: ${askYes.toFixed(2)} | Ask NO: ${askNo.toFixed(2)}`,
+      gapPct <= 0 ? "⚡ PROFITABLE — within arb range!" : `📐 ${gapPct.toFixed(2)}% from profitability`,
+    ].join("\n");
+    await this.sendMessage(msg);
+  }
+
+  /**
+   * Alert on cross-event arb candidates.
+   */
+  async notifyCrossEventArb(
+    marketA: string,
+    marketB: string,
+    divergencePct: number,
+    estimatedProfitPct: number
+  ): Promise<void> {
+    const msg = [
+      "🔗 <b>Cross-Event Arb</b>",
+      `A: ${marketA}`,
+      `B: ${marketB}`,
+      `Divergence: ${divergencePct.toFixed(1)}%`,
+      `Est. Profit: ${estimatedProfitPct.toFixed(1)}%`,
+    ].join("\n");
+    await this.sendMessage(msg);
+  }
+
+  /**
+   * Scanner discovery notification.
+   */
+  async notifyScannerDiscovery(
+    count: number,
+    topMarket: string,
+    topScore: number
+  ): Promise<void> {
+    const msg = [
+      "🔍 <b>Scanner Discovery</b>",
+      `Found: ${count} new markets`,
+      `Top: ${topMarket}`,
+      `Score: ${topScore.toFixed(0)}`,
+    ].join("\n");
+    await this.sendMessage(msg);
+  }
 }
