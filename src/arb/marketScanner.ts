@@ -192,6 +192,16 @@ export class MarketScanner {
   private readonly weights: ScoringWeights;
   private timer: ReturnType<typeof setInterval> | null = null;
   private onDiscovery: ((markets: Market[]) => void) | null = null;
+  private _lastResults: ScoredCandidate[] = [];
+  private _lastScanAt: number = 0;
+  private _scanning = false;
+
+  /** Cached results from the most recent scan. */
+  getLastResults(): ScoredCandidate[] { return this._lastResults; }
+  /** Timestamp of last completed scan (ms epoch). */
+  getLastScanAt(): number { return this._lastScanAt; }
+  /** Whether a scan is currently running. */
+  isScanning(): boolean { return this._scanning; }
 
   constructor(cfg: ScannerConfig) {
     this.cfg = {
@@ -354,7 +364,12 @@ export class MarketScanner {
 
   private async runScan(): Promise<void> {
     try {
+      this._scanning = true;
       const candidates = await this.scan();
+      this._lastResults = candidates;
+      this._lastScanAt = Date.now();
+      this._scanning = false;
+
       if (candidates.length === 0) {
         logger.info("No candidates found this scan cycle");
         return;
@@ -368,6 +383,7 @@ export class MarketScanner {
         this.onDiscovery(newMarkets);
       }
     } catch (err) {
+      this._scanning = false;
       logger.error({ err }, "Scan failed");
     }
   }

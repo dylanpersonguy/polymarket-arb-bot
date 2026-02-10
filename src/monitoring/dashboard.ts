@@ -31,6 +31,7 @@ import type {
   BotStatus,
   MarketGap,
 } from "./types.js";
+import type { MarketScanner } from "../arb/marketScanner.js";
 
 export type { ScanSnapshot };
 
@@ -49,6 +50,7 @@ export interface DashboardDeps {
   enableLiveTrading: boolean;
   scanState: () => ScanSnapshot;
   botStatus: () => BotStatus;
+  scanner: MarketScanner | null;
   // collectors
   incidents: IncidentTracker;
   funnel: FunnelTracker;
@@ -73,6 +75,15 @@ export function startDashboard(port: number, deps: DashboardDeps): http.Server {
       return;
     }
 
+    if (url.pathname === "/api/scanner") {
+      res.writeHead(200, {
+        "Content-Type": "application/json",
+        "Access-Control-Allow-Origin": "*",
+      });
+      res.end(JSON.stringify(buildScannerPayload(deps)));
+      return;
+    }
+
     res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
     res.end(DASHBOARD_HTML);
   });
@@ -82,6 +93,83 @@ export function startDashboard(port: number, deps: DashboardDeps): http.Server {
   });
 
   return server;
+}
+
+/* ---- Build scanner payload ---- */
+
+interface ScannerPayloadCandidate {
+  eventTitle: string;
+  score: number;
+  outcomeCount: number;
+  negRisk: boolean;
+  liquidityUsd: number;
+  volume24h: number;
+  spread: number;
+  gapPct: number | null;
+  sumAsks: number | null;
+  reasons: string[];
+  outcomes: { label: string }[];
+  marketKind: "binary" | "multi";
+}
+
+interface ScannerPayload {
+  enabled: boolean;
+  scanning: boolean;
+  lastScanAt: number;
+  totalCandidates: number;
+  negRiskCount: number;
+  binaryCount: number;
+  positiveGapCount: number;
+  bestGapPct: number | null;
+  candidates: ScannerPayloadCandidate[];
+}
+
+function buildScannerPayload(d: DashboardDeps): ScannerPayload {
+  if (!d.scanner) {
+    return {
+      enabled: false, scanning: false, lastScanAt: 0,
+      totalCandidates: 0, negRiskCount: 0, binaryCount: 0,
+      positiveGapCount: 0, bestGapPct: null, candidates: [],
+    };
+  }
+
+  const results = d.scanner.getLastResults();
+  const negRiskCount = results.filter((c) => c.negRisk).length;
+  const binaryCount = results.filter((c) => !c.negRisk).length;
+  const positiveGaps = results.filter((c) => c.gapPct !== null && c.gapPct > 0);
+  const bestGap = positiveGaps.length > 0
+    ? Math.max(...positiveGaps.map((c) => c.gapPct!))
+    : null;
+
+  // Return top 100 candidates for the dashboard
+  const candidates: ScannerPayloadCandidate[] = results.slice(0, 100).map((c) => ({
+    eventTitle: c.eventTitle,
+    score: c.score,
+    outcomeCount: c.outcomeCount,
+    negRisk: c.negRisk,
+    liquidityUsd: c.liquidityUsd,
+    volume24h: c.volume24h,
+    spread: c.spread,
+    gapPct: c.gapPct,
+    sumAsks: c.sumAsks,
+    reasons: c.reasons,
+    outcomes: c.market.kind === "multi"
+      ? c.market.outcomes.map((o) => ({ label: o.label }))
+      : [{ label: "Yes" }, { label: "No" }],
+    marketKind: c.market.kind,
+  }));
+
+  return {
+    enabled: true,
+    scanning: d.scanner.isScanning(),
+    lastScanAt: d.scanner.getLastScanAt(),
+    totalCandidates: results.length,
+    negRiskCount,
+    binaryCount,
+    positiveGapCount: positiveGaps.length,
+    bestGapPct: bestGap,
+    candidates,
+  };
 }
 
 /* ---- Build full payload ---- */
@@ -359,6 +447,39 @@ tr:hover td{background:rgba(88,166,255,0.03);}
 
 @media(max-width:1200px){.kpi-row{grid-template-columns:repeat(4,1fr);}.grid-3{grid-template-columns:1fr 1fr;}}
 @media(max-width:768px){.kpi-row{grid-template-columns:repeat(2,1fr);}.grid-2,.grid-2-1{grid-template-columns:1fr;}.drawer{width:100%;}}
+
+/* Nav Tabs */
+.nav-tabs{display:flex;gap:4px;padding:0 20px;background:var(--bg2);border-bottom:1px solid var(--border);}
+.nav-tab{padding:10px 20px;font-size:13px;font-weight:600;cursor:pointer;color:var(--dim);border-bottom:2px solid transparent;transition:all 0.15s;user-select:none;}
+.nav-tab:hover{color:var(--text);}
+.nav-tab.active{color:var(--accent);border-bottom-color:var(--accent);}
+.nav-tab .nav-icon{margin-right:6px;}
+.tab-page{display:none;}.tab-page.active{display:block;}
+
+/* Scanner Tab */
+.scanner-kpi-row{display:grid;grid-template-columns:repeat(6,1fr);gap:10px;margin-bottom:14px;}
+.scanner-status{display:flex;align-items:center;gap:8px;margin-bottom:14px;padding:10px 14px;background:var(--card);border:1px solid var(--border);border-radius:8px;font-size:12px;}
+.scanner-status .status-dot{width:10px;height:10px;border-radius:50%;flex-shrink:0;}
+.scanner-status .status-dot.scanning{background:var(--yellow);animation:pulse 1s infinite;}
+.scanner-status .status-dot.ready{background:var(--green);}
+.scanner-status .status-dot.disabled{background:var(--muted);}
+.scanner-filter-bar{display:flex;gap:12px;align-items:center;margin-bottom:14px;padding:8px 14px;background:var(--card);border:1px solid var(--border);border-radius:8px;}
+.scanner-filter-bar label{font-size:11px;color:var(--dim);font-weight:600;text-transform:uppercase;letter-spacing:0.5px;}
+.scanner-filter-bar select,.scanner-filter-bar input{background:var(--bg2);border:1px solid var(--border);color:var(--text);padding:4px 8px;border-radius:4px;font-family:var(--font);font-size:11px;}
+.scanner-filter-bar select:focus,.scanner-filter-bar input:focus{outline:none;border-color:var(--accent);}
+.scanner-btn{padding:5px 14px;border-radius:4px;font-size:11px;font-weight:700;cursor:pointer;border:1px solid var(--accent);background:var(--blue-bg);color:var(--accent);transition:all 0.15s;}
+.scanner-btn:hover{background:rgba(88,166,255,0.15);}
+.scanner-btn:disabled{opacity:0.4;cursor:not-allowed;}
+.gap-positive{color:var(--green);font-weight:700;}
+.gap-neutral{color:var(--yellow);}
+.gap-negative{color:var(--muted);}
+.neg-risk-badge{background:rgba(188,140,255,0.15);color:var(--purple);padding:1px 6px;border-radius:3px;font-size:9px;font-weight:700;letter-spacing:0.5px;}
+.binary-badge{background:var(--blue-bg);color:var(--accent);padding:1px 6px;border-radius:3px;font-size:9px;font-weight:700;letter-spacing:0.5px;}
+.outcome-pills{display:flex;flex-wrap:wrap;gap:3px;margin-top:4px;}
+.outcome-pill{background:rgba(125,133,144,0.1);color:var(--dim);padding:1px 6px;border-radius:3px;font-size:10px;font-family:var(--font);}
+.scanner-expand{cursor:pointer;color:var(--accent);font-size:10px;font-weight:600;margin-left:4px;}
+.score-bar{display:inline-block;height:6px;border-radius:3px;margin-right:6px;vertical-align:middle;}
+@media(max-width:1200px){.scanner-kpi-row{grid-template-columns:repeat(3,1fr);}}
 </style>
 </head>
 <body>
@@ -380,6 +501,12 @@ tr:hover td{background:rgba(88,166,255,0.03);}
   </div>
 </div>
 
+<div class="nav-tabs">
+  <div class="nav-tab active" data-page="overview"><span class="nav-icon">\\uD83D\\uDCCA</span>Overview</div>
+  <div class="nav-tab" data-page="scanner"><span class="nav-icon">\\uD83D\\uDD0D</span>Market Scanner</div>
+</div>
+
+<div class="tab-page active" id="page-overview">
 <div class="main">
 
 <div class="kpi-row">
@@ -527,6 +654,82 @@ tr:hover td{background:rgba(88,166,255,0.03);}
 </div>
 
 </div>
+</div><!-- end page-overview -->
+
+<div class="tab-page" id="page-scanner">
+<div class="main">
+
+<div class="scanner-status" id="scanner-status">
+  <div class="status-dot disabled" id="scanner-dot"></div>
+  <span id="scanner-status-text">Scanner not enabled. Set marketDiscoveryEnabled: true in config.json</span>
+  <span style="margin-left:auto;font-family:var(--font);color:var(--muted);font-size:11px;" id="scanner-last-scan"></span>
+</div>
+
+<div class="scanner-kpi-row">
+  <div class="kpi"><div class="label">Total Candidates</div><div class="value" id="sc-total">0</div><div class="sub">from last scan</div></div>
+  <div class="kpi"><div class="label">NegRisk Multi</div><div class="value val-blue" id="sc-neg">0</div><div class="sub">multi-outcome</div></div>
+  <div class="kpi"><div class="label">Binary</div><div class="value" id="sc-bin">0</div><div class="sub">two-outcome</div></div>
+  <div class="kpi"><div class="label">Positive Gap</div><div class="value val-green" id="sc-pos">0</div><div class="sub">sum &lt; $1.00</div></div>
+  <div class="kpi"><div class="label">Best Gap</div><div class="value val-green" id="sc-best">\\u2014</div><div class="sub" id="sc-best-sub">\\u2014</div></div>
+  <div class="kpi"><div class="label">Scan Status</div><div class="value" id="sc-status-val">\\u2014</div><div class="sub" id="sc-status-sub">\\u2014</div></div>
+</div>
+
+<div class="scanner-filter-bar">
+  <label>Show:</label>
+  <select id="sc-filter-type">
+    <option value="all">All</option>
+    <option value="negRisk">NegRisk Only</option>
+    <option value="binary">Binary Only</option>
+    <option value="positive">Positive Gap Only</option>
+  </select>
+  <label>Min Score:</label>
+  <input type="number" id="sc-filter-score" value="0" min="0" max="200" style="width:60px">
+  <label>Sort:</label>
+  <select id="sc-sort">
+    <option value="score">Score</option>
+    <option value="gap">Gap %</option>
+    <option value="liquidity">Liquidity</option>
+    <option value="volume">Volume 24h</option>
+    <option value="outcomes">Outcomes</option>
+  </select>
+  <span style="margin-left:auto;color:var(--muted);font-size:11px;" id="sc-showing">\\u2014</span>
+</div>
+
+<div class="full">
+  <div class="card">
+    <div class="card-header"><span class="card-title"><span class="card-icon">\\uD83D\\uDD0D</span>Discovered Markets</span></div>
+    <div style="max-height:600px;overflow-y:auto;">
+      <table>
+        <thead><tr>
+          <th style="width:30px">#</th>
+          <th>Score</th>
+          <th>Market</th>
+          <th>Type</th>
+          <th>Outcomes</th>
+          <th>Gap %</th>
+          <th>\\u03A3 Asks</th>
+          <th>Liquidity</th>
+          <th>Vol 24h</th>
+          <th>Spread</th>
+        </tr></thead>
+        <tbody id="scanner-tbody"></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<div id="scanner-detail-card" class="full" style="display:none;">
+  <div class="card">
+    <div class="card-header">
+      <span class="card-title"><span class="card-icon">\\uD83C\\uDFAF</span>Candidate Detail</span>
+      <span class="scanner-btn" onclick="document.getElementById('scanner-detail-card').style.display='none'">Close</span>
+    </div>
+    <div id="scanner-detail-content"></div>
+  </div>
+</div>
+
+</div>
+</div><!-- end page-scanner -->
 
 <div class="drawer-overlay" id="drawer-overlay"></div>
 <div class="drawer" id="drawer">
@@ -538,7 +741,7 @@ tr:hover td{background:rgba(88,166,255,0.03);}
 </div>
 
 <script>
-var MAX_H=150,gapH=[],bookH=[],timeH=[],logEntries=[],lastCycle=0,activeFP='10m',activePP='1h',curD=null;
+var MAX_H=150,gapH=[],bookH=[],timeH=[],logEntries=[],lastCycle=0,activeFP='10m',activePP='1h',curD=null,curScan=null;
 
 Chart.defaults.color='#7d8590';Chart.defaults.borderColor='#252d38';
 var CO={responsive:true,maintainAspectRatio:false,animation:{duration:200},plugins:{legend:{display:false}}};
@@ -640,7 +843,164 @@ if(d.bot.lastError&&d.bot.lastErrorAt&&Date.now()-d.bot.lastErrorAt<10000)addLog
 
 }catch(err){addLog('\\u26A0\\uFE0F Fetch: '+err.message,'err');}}
 
+/* ---- Nav Tabs ---- */
+document.querySelectorAll('.nav-tab').forEach(function(tab){
+  tab.onclick=function(){
+    document.querySelectorAll('.nav-tab').forEach(function(t){t.classList.remove('active');});
+    document.querySelectorAll('.tab-page').forEach(function(p){p.classList.remove('active');});
+    tab.classList.add('active');
+    document.getElementById('page-'+tab.dataset.page).classList.add('active');
+    if(tab.dataset.page==='scanner'&&!curScan)pollScanner();
+  };
+});
+
+/* ---- Scanner Tab ---- */
+function fmtU(n){if(n>=1e6)return'$'+(n/1e6).toFixed(1)+'M';if(n>=1e3)return'$'+(n/1e3).toFixed(1)+'K';return'$'+n.toFixed(0);}
+function gapCls(g){if(g==null)return'gap-neutral';if(g>0)return'gap-positive';if(g>-0.02)return'gap-neutral';return'gap-negative';}
+function scoreColor(s){if(s>=100)return'var(--green)';if(s>=70)return'var(--yellow)';if(s>=40)return'var(--accent)';return'var(--dim)';}
+
+function renderScanner(d){
+  curScan=d;
+  var dot=document.getElementById('scanner-dot');
+  var stxt=document.getElementById('scanner-status-text');
+  var lscan=document.getElementById('scanner-last-scan');
+
+  if(!d.enabled){
+    dot.className='status-dot disabled';
+    stxt.textContent='Scanner not enabled. Set marketDiscoveryEnabled: true in config.json';
+    lscan.textContent='';
+    return;
+  }
+
+  if(d.scanning){
+    dot.className='status-dot scanning';
+    stxt.textContent='Scanning Gamma API for inefficient markets...';
+  }else{
+    dot.className='status-dot ready';
+    stxt.textContent='Scanner active \\u2014 '+d.totalCandidates+' candidates found';
+  }
+  lscan.textContent=d.lastScanAt?'Last scan: '+tA(d.lastScanAt):'Never scanned';
+
+  document.getElementById('sc-total').textContent=d.totalCandidates;
+  document.getElementById('sc-neg').textContent=d.negRiskCount;
+  document.getElementById('sc-bin').textContent=d.binaryCount;
+  document.getElementById('sc-pos').textContent=d.positiveGapCount;
+
+  if(d.bestGapPct!=null){
+    document.getElementById('sc-best').textContent='+'+(d.bestGapPct*100).toFixed(2)+'%';
+    document.getElementById('sc-best-sub').textContent='sum < $1';
+  }else{
+    document.getElementById('sc-best').textContent='\\u2014';
+    document.getElementById('sc-best-sub').textContent='no positive gaps';
+  }
+
+  document.getElementById('sc-status-val').textContent=d.scanning?'Scanning':'Ready';
+  document.getElementById('sc-status-val').className='value '+(d.scanning?'val-yellow':'val-green');
+  document.getElementById('sc-status-sub').textContent=d.totalCandidates+' candidates';
+
+  renderScannerTable(d.candidates);
+}
+
+function renderScannerTable(candidates){
+  var ft=document.getElementById('sc-filter-type').value;
+  var ms=parseInt(document.getElementById('sc-filter-score').value)||0;
+  var sort=document.getElementById('sc-sort').value;
+
+  var filtered=candidates.filter(function(c){
+    if(ft==='negRisk'&&!c.negRisk)return false;
+    if(ft==='binary'&&c.negRisk)return false;
+    if(ft==='positive'&&(c.gapPct==null||c.gapPct<=0))return false;
+    if(c.score<ms)return false;
+    return true;
+  });
+
+  if(sort==='gap')filtered.sort(function(a,b){return(b.gapPct||-.99)-(a.gapPct||-.99);});
+  else if(sort==='liquidity')filtered.sort(function(a,b){return b.liquidityUsd-a.liquidityUsd;});
+  else if(sort==='volume')filtered.sort(function(a,b){return b.volume24h-a.volume24h;});
+  else if(sort==='outcomes')filtered.sort(function(a,b){return b.outcomeCount-a.outcomeCount;});
+  else filtered.sort(function(a,b){return b.score-a.score;});
+
+  document.getElementById('sc-showing').textContent='Showing '+filtered.length+' of '+candidates.length;
+
+  var tb=document.getElementById('scanner-tbody');
+  if(filtered.length===0){
+    tb.innerHTML='<tr><td colspan="10" style="text-align:center;color:var(--muted);padding:30px">No candidates match filters</td></tr>';
+    return;
+  }
+
+  tb.innerHTML=filtered.map(function(c,i){
+    var sw=Math.min(60,c.score/2);
+    var sc='<span class="score-bar" style="width:'+sw+'px;background:'+scoreColor(c.score)+'"></span>'+c.score.toFixed(0);
+    var typeBadge=c.negRisk?'<span class="neg-risk-badge">NEGRISK</span>':'<span class="binary-badge">BINARY</span>';
+    var gapVal=c.gapPct!=null?(c.gapPct>0?'+':'')+(c.gapPct*100).toFixed(2)+'%':'\\u2014';
+    var gapClass=gapCls(c.gapPct);
+    var sumVal=c.sumAsks!=null?c.sumAsks.toFixed(4):'\\u2014';
+    var outPrev=c.outcomes.slice(0,3).map(function(o){return o.label;}).join(', ');
+    var outMore=c.outcomeCount>3?' +' +(c.outcomeCount-3):'';
+    return'<tr style="cursor:pointer" onclick="showScanDetail('+i+')">'+
+      '<td>'+(i+1)+'</td>'+
+      '<td>'+sc+'</td>'+
+      '<td style="max-width:250px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+c.eventTitle+'">'+c.eventTitle+'</td>'+
+      '<td>'+typeBadge+'</td>'+
+      '<td>'+c.outcomeCount+'</td>'+
+      '<td class="'+gapClass+'">'+gapVal+'</td>'+
+      '<td>'+sumVal+'</td>'+
+      '<td>'+fmtU(c.liquidityUsd)+'</td>'+
+      '<td>'+fmtU(c.volume24h)+'</td>'+
+      '<td>'+(c.spread*100).toFixed(1)+'%</td>'+
+      '</tr>'+
+      '<tr style="border:none"><td></td><td colspan="9"><div class="outcome-pills">'+
+      c.outcomes.slice(0,6).map(function(o){return'<span class="outcome-pill">'+o.label+'</span>';}).join('')+
+      (c.outcomeCount>6?'<span class="outcome-pill" style="color:var(--accent)">+' +(c.outcomeCount-6)+' more</span>':'')+
+      '</div></td></tr>';
+  }).join('');
+}
+
+function showScanDetail(idx){
+  if(!curScan||!curScan.candidates[idx])return;
+  var c=curScan.candidates[idx];
+  var el=document.getElementById('scanner-detail-content');
+  var html='<div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:14px;">'+
+    '<div class="kpi" style="padding:10px"><div class="label">Score</div><div class="value" style="font-size:20px;color:'+scoreColor(c.score)+'">'+c.score.toFixed(0)+'</div></div>'+
+    '<div class="kpi" style="padding:10px"><div class="label">Gap</div><div class="value '+gapCls(c.gapPct)+'" style="font-size:20px">'+(c.gapPct!=null?(c.gapPct>0?'+':'')+(c.gapPct*100).toFixed(2)+'%':'N/A')+'</div></div>'+
+    '<div class="kpi" style="padding:10px"><div class="label">Liquidity</div><div class="value" style="font-size:20px">'+fmtU(c.liquidityUsd)+'</div></div>'+
+    '<div class="kpi" style="padding:10px"><div class="label">Volume 24h</div><div class="value" style="font-size:20px">'+fmtU(c.volume24h)+'</div></div>'+
+    '</div>';
+
+  html+='<div style="margin-bottom:14px"><div style="font-size:11px;color:var(--dim);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:6px;">Event</div>'+
+    '<div style="font-size:14px;font-weight:600;">'+c.eventTitle+'</div></div>';
+
+  html+='<div style="margin-bottom:14px"><div style="font-size:11px;color:var(--dim);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:6px;">Type</div>'+
+    (c.negRisk?'<span class="neg-risk-badge">NEGRISK</span>':'<span class="binary-badge">BINARY</span>')+
+    ' \\u00B7 '+c.outcomeCount+' outcomes \\u00B7 spread '+(c.spread*100).toFixed(1)+'%'+
+    (c.sumAsks!=null?' \\u00B7 \\u03A3asks '+c.sumAsks.toFixed(4):'')+'</div>';
+
+  html+='<div style="margin-bottom:14px"><div style="font-size:11px;color:var(--dim);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:6px;">Score Breakdown</div>'+
+    '<div style="display:flex;flex-wrap:wrap;gap:4px;">'+c.reasons.map(function(r){return'<span style="background:rgba(88,166,255,0.08);border:1px solid rgba(88,166,255,0.2);color:var(--accent);padding:2px 8px;border-radius:4px;font-size:11px;font-family:var(--font)">'+r+'</span>';}).join('')+'</div></div>';
+
+  html+='<div><div style="font-size:11px;color:var(--dim);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:6px;">Outcomes</div>'+
+    '<div style="display:flex;flex-wrap:wrap;gap:4px;">'+c.outcomes.map(function(o){return'<span class="outcome-pill" style="padding:3px 8px">'+o.label+'</span>';}).join('')+'</div></div>';
+
+  el.innerHTML=html;
+  document.getElementById('scanner-detail-card').style.display='block';
+  document.getElementById('scanner-detail-card').scrollIntoView({behavior:'smooth'});
+}
+
+document.getElementById('sc-filter-type').onchange=function(){if(curScan)renderScannerTable(curScan.candidates);};
+document.getElementById('sc-filter-score').onchange=function(){if(curScan)renderScannerTable(curScan.candidates);};
+document.getElementById('sc-sort').onchange=function(){if(curScan)renderScannerTable(curScan.candidates);};
+
+async function pollScanner(){
+  try{
+    var res=await fetch('/api/scanner');
+    var d=await res.json();
+    renderScanner(d);
+  }catch(err){console.error('Scanner poll error',err);}
+}
+
 poll();setInterval(poll,3000);
+setInterval(function(){if(document.getElementById('page-scanner').classList.contains('active'))pollScanner();},10000);
+pollScanner();
 <\/script>
 </body>
 </html>`;

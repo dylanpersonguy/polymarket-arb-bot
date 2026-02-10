@@ -244,6 +244,7 @@ export async function main(): Promise<void> {
     enableLiveTrading: cfg.enableLiveTrading,
     scanState: () => scanState,
     botStatus,
+    scanner,
     incidents,
     funnel,
     timeline,
