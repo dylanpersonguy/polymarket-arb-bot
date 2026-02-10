@@ -22,6 +22,17 @@ import { TradeRepository, ConfigSnapshotRepository } from "./storage/repositorie
 import { closeDb } from "./storage/db.js";
 import { sleep } from "./utils/sleep.js";
 import { startDashboard, type ScanSnapshot } from "./monitoring/dashboard.js";
+import {
+  IncidentTracker,
+  FunnelTracker,
+  TradeTimeline,
+  MarketPerfTracker,
+  CircuitBreakerTracker,
+  PnlTracker,
+  ExecQualityTracker,
+  DataQualityTracker,
+} from "./monitoring/collectors.js";
+import type { BotStatus, BotState } from "./monitoring/types.js";
 
 const logger = pino({ name: "Main" });
 
@@ -176,20 +187,66 @@ export async function main(): Promise<void> {
     cycle: 0,
     freshBooks: 0,
     totalTokenIds,
-    oppsThisCycle: 0,
-    qualifiedThisCycle: 0,
+    opps: 0,
+    qualified: 0,
     lastOpp: null,
     marketGaps: [],
   };
+
+  // Collectors
+  const incidents = new IncidentTracker();
+  const funnel = new FunnelTracker();
+  const timeline = new TradeTimeline();
+  const marketPerf = new MarketPerfTracker();
+  const cbTracker = new CircuitBreakerTracker();
+  const pnlTracker = new PnlTracker();
+  const execQuality = new ExecQualityTracker();
+  const dataQuality = new DataQualityTracker();
+
+  // Track WS connection state
+  if (wsManager) {
+    dataQuality.setWsConnected(true);
+  }
+
+  // Bot status
+  const botStartedAt = Date.now();
+  let botState: BotState = "RUNNING";
+  let lastError: string | null = null;
+  let lastErrorAt: number | null = null;
+  let lastRecoveryAction: string | null = null;
+
+  const botStatus = (): BotStatus => ({
+    state: botState,
+    mode: mode as "dry" | "paper" | "live",
+    liveArmed: cfg.enableLiveTrading,
+    lastError,
+    lastErrorAt,
+    lastRecoveryAction,
+    startedAt: botStartedAt,
+  });
 
   const DASHBOARD_PORT = parseInt(env.DASHBOARD_PORT ?? "3456", 10);
   const dashboardServer = startDashboard(DASHBOARD_PORT, {
     metrics,
     health,
     bookMgr,
+    riskMgr,
+    positionMgr,
+    orderMgr,
+    posMonitor,
     markets: () => markets,
     mode,
+    enableLiveTrading: cfg.enableLiveTrading,
     scanState: () => scanState,
+    botStatus,
+    incidents,
+    funnel,
+    timeline,
+    marketPerf,
+    cbTracker,
+    pnlTracker,
+    execQuality,
+    dataQuality,
   });
 
   /* ---- Graceful shutdown ---- */
@@ -247,10 +304,13 @@ export async function main(): Promise<void> {
 
           for (const tid of tokenIds) {
             try {
+              const t1 = Date.now();
               const book = await clobClient.getOrderBook(tid);
+              dataQuality.recordLatency(Date.now() - t1);
               if (book) { bookMgr.set(tid, book); fetched++; }
             } catch (err) {
               failed++;
+              dataQuality.recordRetry();
               logger.debug({ tokenId: tid, err: String(err) }, "Book fetch failed");
             }
           }
@@ -340,9 +400,15 @@ export async function main(): Promise<void> {
 
       metrics.inc("scan_cycles");
 
+      // Feed funnel: record all detected opps
+      for (let _i = 0; _i < opps.length; _i++) funnel.record("detected");
+
       // 3. Filter: min profit, dedup/cooldown, then pick best
       let qualified = filterByMinProfitBps(opps, cfg.minProfit * 10_000);
       qualified = filterSuppressed(qualified, oppTracker);   // #11
+
+      // Feed funnel: record passed filters
+      for (let _i = 0; _i < qualified.length; _i++) funnel.record("passed_filters");
 
       // Log every cycle for visibility
       if (loopCount <= 3 || loopCount % 10 === 0) {
@@ -369,6 +435,7 @@ export async function main(): Promise<void> {
           if (yb && nb) {
             marketGaps.push({
               market: market.name,
+              kind: "binary",
               askYes: yb.bestAskPrice,
               askNo: nb.bestAskPrice,
               gap: +((yb.bestAskPrice + nb.bestAskPrice - 1) * 100).toFixed(3),
@@ -376,20 +443,34 @@ export async function main(): Promise<void> {
               bidNo: nb.bestBidPrice,
               spreadYes: +((yb.bestAskPrice - yb.bestBidPrice) * 100).toFixed(2),
               spreadNo: +((nb.bestAskPrice - nb.bestBidPrice) * 100).toFixed(2),
+              yesAge: Date.now() - yb.lastUpdatedMs,
+              noAge: Date.now() - nb.lastUpdatedMs,
             });
           }
         }
       }
       scanState.cycle = loopCount;
       scanState.freshBooks = freshBooks.size;
-      scanState.oppsThisCycle = opps.length;
-      scanState.qualifiedThisCycle = qualified.length;
+      scanState.opps = opps.length;
+      scanState.qualified = qualified.length;
       scanState.marketGaps = marketGaps;
 
       const best = bestOpportunity(qualified);
 
       if (best) {
         metrics.inc("opportunities_found");
+        funnel.record("passed_risk");  // if we got here, risk check passed
+
+        // Start trade timeline
+        timeline.start(
+          best.tradeId,
+          best.marketName,
+          best.type === "binary_complement" ? "binary_complement" : "multi_outcome",
+          best.expectedProfitBps,
+        );
+        timeline.addEvent(best.tradeId, "validated");
+        timeline.addEvent(best.tradeId, "risk_checked");
+
         scanState.lastOpp = {
           marketName: best.marketName,
           expectedProfit: best.expectedProfit,
@@ -492,6 +573,20 @@ export async function main(): Promise<void> {
         // 6. Notify
         if (execResult.success) {
           metrics.inc("successful_trades");
+          funnel.record("orders_placed");
+          funnel.record("fully_filled");
+          timeline.addEvent(best.tradeId, "leg_a_filled");
+          timeline.addEvent(best.tradeId, "leg_b_filled");
+          timeline.finalize(best.tradeId, true, best.expectedProfitBps);
+
+          // Track per-market performance
+          marketPerf.recordTrade(best.marketName, best.expectedProfit, true, false, 0, best.expectedProfitBps);
+
+          // PnL attribution (approximate)
+          pnlTracker.record(best.expectedProfit, best.totalCost * (cfg.takerFeeBps / 10_000), 0, 0);
+
+          funnel.record("net_profitable");
+
           await telegram.notifyTrade(
             execResult.tradeId,
             best.marketName,
@@ -500,10 +595,19 @@ export async function main(): Promise<void> {
           );
         } else {
           metrics.inc("failed_trades");
+          funnel.record("orders_placed");
+          timeline.addEvent(best.tradeId, "leg_a_placed");
           if (execResult.hedged) {
             metrics.inc("hedged_trades");
             metrics.observe("hedge_loss", execResult.lossUsd);
+            funnel.record("hedged");
+            timeline.addEvent(best.tradeId, "hedge_triggered", `loss: $${execResult.lossUsd.toFixed(2)}`);
+            marketPerf.recordTrade(best.marketName, -execResult.lossUsd, false, true, 0, best.expectedProfitBps);
+            pnlTracker.record(0, 0, 0, execResult.lossUsd);
+          } else {
+            marketPerf.recordTrade(best.marketName, 0, false, false, 0, best.expectedProfitBps);
           }
+          timeline.finalize(best.tradeId, false);
           if (execResult.error) {
             await telegram.notifyError("Execution", execResult.error);
           }
@@ -513,6 +617,17 @@ export async function main(): Promise<void> {
       metrics.inc("loop_errors");
       logger.error({ err: String(err) }, "Main loop error");
       riskMgr.recordError();
+      cbTracker.recordError();
+      lastError = String(err);
+      lastErrorAt = Date.now();
+      incidents.add("MED", "loop_error", String(err));
+
+      // Update bot state if safe mode triggered
+      const rs = riskMgr.getState();
+      if (rs.safeModeActive) {
+        botState = "SAFE_MODE";
+        lastRecoveryAction = "safe mode activated";
+      }
     }
 
     health.markLoopEnd();
