@@ -88,16 +88,20 @@ function buildStatus(deps: DashboardDeps): Record<string, unknown> {
       const mb = m as MarketBinary;
       const yb = deps.bookMgr.get(mb.yesTokenId);
       const nb = deps.bookMgr.get(mb.noTokenId);
+      const ayp = yb && isFinite(yb.bestAskPrice) ? yb.bestAskPrice : null;
+      const anp = nb && isFinite(nb.bestAskPrice) ? nb.bestAskPrice : null;
+      const byp = yb && isFinite(yb.bestBidPrice) ? yb.bestBidPrice : null;
+      const bnp = nb && isFinite(nb.bestBidPrice) ? nb.bestBidPrice : null;
       marketData.push({
         name: mb.name,
         kind: "binary",
-        askYes: yb?.bestAskPrice ?? null,
-        bidYes: yb?.bestBidPrice ?? null,
-        askNo: nb?.bestAskPrice ?? null,
-        bidNo: nb?.bestBidPrice ?? null,
-        gap: yb && nb ? +((yb.bestAskPrice + nb.bestAskPrice - 1) * 100).toFixed(3) : null,
-        spreadYes: yb ? +((yb.bestAskPrice - yb.bestBidPrice) * 100).toFixed(2) : null,
-        spreadNo: nb ? +((nb.bestAskPrice - nb.bestBidPrice) * 100).toFixed(2) : null,
+        askYes: ayp,
+        bidYes: byp,
+        askNo: anp,
+        bidNo: bnp,
+        gap: ayp !== null && anp !== null ? +((ayp + anp - 1) * 100).toFixed(3) : null,
+        spreadYes: ayp !== null && byp !== null ? +((ayp - byp) * 100).toFixed(2) : null,
+        spreadNo: anp !== null && bnp !== null ? +((anp - bnp) * 100).toFixed(2) : null,
         yesAge: yb ? Date.now() - yb.lastUpdatedMs : null,
         noAge: nb ? Date.now() - nb.lastUpdatedMs : null,
       });
@@ -108,13 +112,14 @@ function buildStatus(deps: DashboardDeps): Record<string, unknown> {
       let allFresh = true;
       for (const o of mm.outcomes) {
         const b = deps.bookMgr.get(o.tokenId);
-        if (b) {
+        if (b && isFinite(b.bestAskPrice)) {
           sumAsks += b.bestAskPrice;
+          const bid = isFinite(b.bestBidPrice) ? b.bestBidPrice : null;
           outcomes.push({
             label: o.label,
             ask: b.bestAskPrice,
-            bid: b.bestBidPrice,
-            spread: +((b.bestAskPrice - b.bestBidPrice) * 100).toFixed(2),
+            bid,
+            spread: bid !== null ? +((b.bestAskPrice - bid) * 100).toFixed(2) : null,
             age: Date.now() - b.lastUpdatedMs,
           });
         } else {
@@ -404,13 +409,16 @@ async function poll() {
     document.getElementById('kpi-mem').textContent = d.health.memoryMB || d.metrics['gauge.memory_mb'] || '—';
     document.getElementById('kpi-loop').textContent = d.health.lastLoopMs || '—';
 
-    // Closest gap
-    const gaps = d.scan.marketGaps || [];
+    // Closest gap — filter out nulls before sorting
+    const gaps = (d.scan.marketGaps || []).filter(g => g.gap !== null && g.gap !== undefined);
     const sorted = gaps.slice().sort((a,b) => a.gap - b.gap);
     const closest = sorted[0];
-    if (closest) {
+    if (closest && closest.gap !== null) {
       document.getElementById('kpi-gap').innerHTML = '<span class="' + gapClass(closest.gap) + '">' + closest.gap.toFixed(2) + '%</span>';
       document.getElementById('kpi-gap-sub').textContent = closest.market;
+    } else {
+      document.getElementById('kpi-gap').textContent = '—';
+      document.getElementById('kpi-gap-sub').textContent = 'no data';
     }
 
     // Charts
@@ -473,7 +481,7 @@ async function poll() {
     }
     lastCycle = d.scan.cycle;
 
-    if (d.scan.lastOpp && d.scan.lastOpp.marketName) {
+    if (d.scan.lastOpp && d.scan.lastOpp.marketName && d.scan.lastOpp.expectedProfit != null) {
       addLog('💰 Opp: ' + d.scan.lastOpp.marketName + ' — ' + (d.scan.lastOpp.expectedProfit * 100).toFixed(2) + '% profit', 'opp');
     }
 
