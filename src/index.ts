@@ -42,14 +42,21 @@ export async function main(): Promise<void> {
   logger.info({ mode, markets: markets.length }, "Starting PolyArb bot");
 
   /* ---- Wire up services ---- */
-  const clobClient = new ClobClient({
-    POLYMARKET_PRIVATE_KEY: env.POLYMARKET_PRIVATE_KEY,
-    MODE: env.MODE,
-    LOG_LEVEL: env.LOG_LEVEL,
-    KILL_SWITCH: env.KILL_SWITCH,
-  });
+  const clobClient = new ClobClient(env);
+  await clobClient.initialize();
 
-  const bookMgr = new OrderBookManager(cfg.pollingIntervalMs * 2 + 200);
+  // Count total token IDs to scale staleness window
+  const totalTokenIds = markets.reduce((n, m) => {
+    if (isBinary(m)) return n + 2;
+    return n + m.outcomes.length;
+  }, 0);
+  // Allow ~120ms per API call (rate limit) + generous buffer
+  const bookMaxAgeMs = Math.max(
+    cfg.pollingIntervalMs * 2 + 200,
+    totalTokenIds * 150 + 2000,
+  );
+  logger.info({ totalTokenIds, bookMaxAgeMs }, "Book staleness window");
+  const bookMgr = new OrderBookManager(bookMaxAgeMs);
   const orderMgr = new OrderManager();
   const positionMgr = new PositionManager();
 
@@ -186,7 +193,7 @@ export async function main(): Promise<void> {
 
   /* ---- Main loop ---- */
   let loopCount = 0;
-  const METRICS_LOG_INTERVAL = 60;
+  const METRICS_LOG_INTERVAL = 10;
   const BALANCE_CHECK_INTERVAL = 10;  // #12 — check balance every N loops
 
   while (running) {
@@ -194,8 +201,8 @@ export async function main(): Promise<void> {
     loopCount++;
 
     try {
-      // #12 — Periodic balance refresh
-      if (loopCount % BALANCE_CHECK_INTERVAL === 1) {
+      // #12 — Periodic balance refresh (skip in dry mode — no auth needed)
+      if (mode !== "dry" && loopCount % BALANCE_CHECK_INTERVAL === 1) {
         try {
           const bal = await clobClient.getBalance();
           riskMgr.updateBalance(bal);
@@ -207,6 +214,9 @@ export async function main(): Promise<void> {
 
       // 1. Refresh order books (skip if WS is feeding them)
       if (!cfg.wsEnabled) {
+        const t0 = Date.now();
+        let fetched = 0;
+        let failed = 0;
         for (const market of markets) {
           const tokenIds: string[] = isBinary(market)
             ? [market.yesTokenId, market.noTokenId]
@@ -215,11 +225,16 @@ export async function main(): Promise<void> {
           for (const tid of tokenIds) {
             try {
               const book = await clobClient.getOrderBook(tid);
-              if (book) bookMgr.set(tid, book);
+              if (book) { bookMgr.set(tid, book); fetched++; }
             } catch (err) {
+              failed++;
               logger.debug({ tokenId: tid, err: String(err) }, "Book fetch failed");
             }
           }
+        }
+        const elapsed = Date.now() - t0;
+        if (loopCount <= 3 || loopCount % 10 === 0) {
+          logger.info({ cycle: loopCount, fetched, failed, elapsedMs: elapsed }, "Book fetch pass");
         }
       }
 
@@ -232,11 +247,25 @@ export async function main(): Promise<void> {
       // Use effective fee throughout
       const effectiveFee = cfg.takerFeeBps;
 
+      // Track closest-to-arb binary market for diagnostics
+      let bestRawGap = Infinity;
+      let bestGapMarket = "";
+      let bestGapAskYes = 0;
+      let bestGapAskNo = 0;
+
       for (const market of markets) {
         if (isBinary(market)) {
           const yesBook = bookMgr.get(market.yesTokenId);
           const noBook = bookMgr.get(market.noTokenId);
           if (yesBook && noBook) {
+            // Raw gap: how far from arb (askYes + askNo - 1)
+            const rawGap = yesBook.bestAskPrice + noBook.bestAskPrice - 1;
+            if (rawGap < bestRawGap) {
+              bestRawGap = rawGap;
+              bestGapMarket = market.name;
+              bestGapAskYes = yesBook.bestAskPrice;
+              bestGapAskNo = noBook.bestAskPrice;
+            }
             const opp = detectBinaryComplementArb(market.name, yesBook, noBook, {
               feeBps: effectiveFee,
               takerFeeBps: cfg.takerFeeBps,
@@ -291,6 +320,23 @@ export async function main(): Promise<void> {
       // 3. Filter: min profit, dedup/cooldown, then pick best
       let qualified = filterByMinProfitBps(opps, cfg.minProfit * 10_000);
       qualified = filterSuppressed(qualified, oppTracker);   // #11
+
+      // Log every cycle for visibility
+      if (loopCount <= 3 || loopCount % 10 === 0) {
+        logger.info(
+          {
+            cycle: loopCount,
+            fresh_books: freshBooks.size,
+            opps: opps.length,
+            qualified: qualified.length,
+            closest_arb: bestGapMarket
+              ? { market: bestGapMarket, gap: +(bestRawGap * 100).toFixed(2), askYes: bestGapAskYes, askNo: bestGapAskNo }
+              : undefined,
+          },
+          "Scan cycle complete",
+        );
+      }
+
       const best = bestOpportunity(qualified);
 
       if (best) {

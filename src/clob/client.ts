@@ -36,12 +36,14 @@ const CLOB_HOST = "https://clob.polymarket.com";
  */
 export class ClobClient {
   private limiter: AdaptiveRateLimiter;
-  private breaker: CircuitBreaker;
+  private bookBreaker: CircuitBreaker;   // public endpoints (order books)
+  private authBreaker: CircuitBreaker;   // authenticated endpoints (balance, orders)
   private sdk: PolyClobClient | null = null;
 
   constructor(private env: Env) {
     this.limiter = new AdaptiveRateLimiter(10, 20);
-    this.breaker = new CircuitBreaker(5, 2, 30_000);
+    this.bookBreaker = new CircuitBreaker(5, 2, 30_000);
+    this.authBreaker = new CircuitBreaker(5, 2, 30_000);
   }
 
   async initialize(): Promise<void> {
@@ -87,7 +89,7 @@ export class ClobClient {
 
   async getOrderBook(tokenId: string): Promise<OrderBook> {
     await this.limiter.acquire();
-    return this.breaker.execute(() =>
+    return this.bookBreaker.execute(() =>
       retry(
         async () => {
           const raw: OrderBookSummary = await this.getSdk().getOrderBook(tokenId);
@@ -150,7 +152,7 @@ export class ClobClient {
     size: number
   ): Promise<Order> {
     await this.limiter.acquire(2);
-    return this.breaker.execute(() =>
+    return this.authBreaker.execute(() =>
       retry(
         async () => {
           logger.info({ tokenId, side, price, size }, "Placing order");
@@ -196,7 +198,7 @@ export class ClobClient {
 
   async cancelOrder(orderId: string): Promise<void> {
     await this.limiter.acquire();
-    await this.breaker.execute(() =>
+    await this.authBreaker.execute(() =>
       retry(
         async () => {
           logger.info({ orderId }, "Cancelling order");
@@ -209,7 +211,7 @@ export class ClobClient {
 
   async getOrderStatus(orderId: string): Promise<Order | null> {
     await this.limiter.acquire();
-    return this.breaker.execute(() =>
+    return this.authBreaker.execute(() =>
       retry(
         async () => {
           try {
@@ -262,7 +264,7 @@ export class ClobClient {
   /** Fetch available USDC collateral balance. */
   async getBalance(): Promise<number> {
     await this.limiter.acquire();
-    return this.breaker.execute(() =>
+    return this.authBreaker.execute(() =>
       retry(
         async () => {
           const resp = await this.getSdk().getBalanceAllowance({
@@ -276,6 +278,6 @@ export class ClobClient {
   }
 
   getCircuitBreakerState(): "closed" | "open" | "half-open" {
-    return this.breaker.getState();
+    return this.bookBreaker.getState();
   }
 }
