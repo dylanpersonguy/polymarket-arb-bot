@@ -145,6 +145,11 @@ export async function main(): Promise<void> {
     scanner = new MarketScanner({
       intervalMs: cfg.marketDiscoveryIntervalMs,
       minLiquidityUsd: cfg.marketDiscoveryMinLiquidityUsd,
+      maxLiquidityUsd: cfg.marketDiscoveryMaxLiquidityUsd,
+      includeNegRisk: cfg.marketDiscoveryIncludeNegRisk,
+      includeBinary: cfg.marketDiscoveryIncludeBinary,
+      minScore: cfg.marketDiscoveryMinScore,
+      maxOutcomes: cfg.marketDiscoveryMaxOutcomes,
     });
     scanner.start((newMarkets: Market[]) => {
       markets = [...markets, ...newMarkets];

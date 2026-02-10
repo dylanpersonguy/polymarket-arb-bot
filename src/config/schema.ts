@@ -89,7 +89,12 @@ export const ConfigSchema = z.object({
   /* ---- Market discovery (#9) ---- */
   marketDiscoveryEnabled: z.boolean().default(false),
   marketDiscoveryIntervalMs: z.number().min(10_000).default(300_000),
-  marketDiscoveryMinLiquidityUsd: z.number().min(0).default(500),
+  marketDiscoveryMinLiquidityUsd: z.number().min(0).default(5_000),
+  marketDiscoveryMaxLiquidityUsd: z.number().min(0).default(500_000),
+  marketDiscoveryIncludeNegRisk: z.boolean().default(true),
+  marketDiscoveryIncludeBinary: z.boolean().default(true),
+  marketDiscoveryMinScore: z.number().min(0).default(25),
+  marketDiscoveryMaxOutcomes: z.number().min(2).default(60),
 
   enableLiveTrading: z.boolean().default(false),
   enableTelegram: z.boolean().default(true),
